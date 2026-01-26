@@ -1,0 +1,159 @@
+district:
+  name: "San Bernardino County Superintendent of Schools"
+
+workability:
+  login_url: "https://www.caworkability.org/auth"
+  # The name of our district in the Search results page if the student is found
+  owning_org_name: "San Bernardino County Alternative Education"
+  # Used ONLY on the search screen
+  search_project: "Any WAI Project"
+  # Used ONLY when creating a new student
+  create_project: "San Bernardino County Alternative Education (236-05)"
+
+credentials:
+  # Optional convenience; user can still be prompted at runtime if blank.
+  username: "derek.carlson@sbcss.net"
+
+input:
+  # Optional convenience for GUI later; runner can still prompt for a path.
+  default_excel_path: ""
+
+columns:
+  first_name: "First Name"
+  last_name: "Last Name"
+  ssid: "State Student ID"
+  dob: "Birthdate"
+  gender: "Gender"
+  grade: "Grade"
+  disability: "Description_CSE_DI"
+  ethcd: "EthCd"
+  race1: "Description_STU_RC1"
+  aeries_school: "School name"
+
+run:
+  headless: false
+  slow_mo_ms: 400
+  resume: true
+  stop_on_error: false
+
+ui:
+  preflight_validate: true
+
+ledger:
+  path: "output/logs/run_ledger.xlsx"
+
+trace:
+  # Keep ONLY this (runner should read trace.on_failure).
+  on_failure: true
+
+validation:
+  require_ssid: true
+  allowed_gender: ["M", "F", "N"]
+  # If disability is blank / "No Disability" / "EMD" / or otherwise unmapped, skip + log.
+  skip_if_disability_missing_or_invalid: true
+
+user_messages:
+  CREATED: "✅ Added successfully"
+  ALREADY_OWNED: "🏫 Already with your district"
+  TRANSFER_REQUESTED: "📨 Transfer requested"
+  TRANSFER_PENDING: "⏳ Transfer pending — awaiting approval"
+  SKIPPED_RESUME: "⏭️ Already processed earlier"
+  SKIPPED_MISSING_SSID: "⚠️ Missing SSID — skipped"
+  NEEDS_INPUT_DATA: "⚠️ Missing/invalid required data — skipped"
+  ERROR: "❌ Could not process — see details"
+
+
+gender_mapping:
+  # Input values from Aeries -> UI label on WAI page (radio group)
+  M: "Male"
+  F: "Female"
+  N: "Non Binary"
+
+grade_mapping:
+  "-2": "Ungraded"
+  "-1": "Ungraded"
+  "0": "Ungraded"
+  "1": "Ungraded"
+  "2": "Ungraded"
+  "3": "Ungraded"
+  "4": "Ungraded"
+  "5": "5"
+  "6": "6"
+  "7": "7"
+  "8": "8"
+  "9": "9"
+  "10": "10"
+  "11": "11"
+  "12": "12"
+  "14": "Ungraded"
+  "15": "Ungraded"
+  "16": "Ungraded"
+  "17": "Ungraded"
+
+disability_mapping:
+  "Intellectual Disability (ID)": "Intellectual Disability (ID)"
+  "Hard of Hearing (HH)": "Hard of Hearing (HH)"
+  "Deafness (DEAF)/Hearing Impairment (HI)": "Deafness (DEAF)"
+  "Speech or Language Impairment (SLI)": "Speech or Language Impairment (SLI)"
+  "Visual Impairment (VI)": "Visual Impairment (VI)"
+  "Emotional Disturbance (ED)": "Emotional Disturbance (ED)"
+  "Orthopedic Impairment (OI)": "Orthopedic Impairment (OI)"
+  "Other Health Impairment (OHI)": "Other Health Impairment (OHI)"
+  "Specific Learning Disability (SLD)": "Specific Learning Disability (SLD)"
+  "Deaf-Blindness (DB)": "Deaf-Blindness (DB)"
+  "Multiple Disability (MD)": "Multiple Disability (MD)"
+  "Autism (AUT)": "Autism (AUT)"
+  "Traumatic Brain Injury (TBI)": "Traumatic Brain Injury (TBI)"
+  # Intentionally omitted:
+  # - "No Disability"
+  # - "Established Medical Disability (EMD)"
+  # Any unmapped value will be treated as invalid and skipped (per validation.skip_if_disability_missing_or_invalid).
+
+race_mapping:
+  "American Indian or Alaskan Native": "American Indian or Alaska Native"
+  "Chinese": "Chinese"
+  "Japanese": "Japanese"
+  "Korean": "Korean"
+  "Vietnamese": "Vietnamese"
+  "Asian Indian": "Asian Indian"
+  "Laotian": "Laotian"
+  "Cambodian": "Cambodian"
+  "Hmong": "Hmong"
+  "Other Asian": "Other Asian"
+  "Hawaiian": "Hawaiian"
+  "Guamanian": "Guamanian"
+  "Samoan": "Samoan"
+  "Tahitian": "Tahitian"
+  "Other Pacific Islander": "Other Pacific Islander"
+  "Filipino": "Filipino"
+  "Black or African American": "Black or African American"
+  "White": "White"
+  "Declined to state/Unknown": "Declined to State"
+
+school_mapping:
+  # Aeries Site Name -> WAI School dropdown (preferred canonical choice) + active flag
+  "SE - DM - AV COUNTY SPEC ED  CENTER": { wai_school: "Apple Valley Alt Ed Center", active: true }
+  "CS - BARBARA PHELPS CS": { wai_school: "Barbara Phelps CHS", active: true }
+  "SE - DM - BARSTOW JH": { wai_school: "Barstow JH", active: true }
+  "CS - BOB MURPHY CS": { wai_school: "Bob Murphy CDS", active: true }
+  "CS - CHAFFEY NORTH CS": { wai_school: "Chaffey North CDS", active: false }
+  "CS - CHAFFEY WEST CS": { wai_school: "David Stine Chaffey West CDS", active: true }
+  "SE - DM - HESPERIA SR": { wai_school: "DM-Hesperia SR", active: true }
+  "SE - DM - SULTANA": { wai_school: "DM-Sultana", active: true }
+  "CS - DOROTHY GIBSON CS": { wai_school: "Dorothy Gibson County High School", active: true }
+  "JCS - EAST VALLEY JUV COURT SCHOOL": { wai_school: "East Valley JCS", active: true }
+  "CS - INDEPENDENT LEARNING ACADEMY (ILA)": { wai_school: "Independent Alternative Education (ILA)", active: true }
+  "SE - EV - EISENHOWER HS": { wai_school: "Eisenhower HS", active: true }
+  "JCS - GATEWAY CENTRAL": { wai_school: "Gateway", active: false }
+  "SE - DM - GRANITE HILL": { wai_school: "Granite Hills", active: true }
+  "SE - DM - NORMA COVERT": { wai_school: "Norma Covert CS", active: true }
+  "SE - EV - REDLANDS EAST VALLEY HS": { wai_school: "Redlands East Valley", active: true }
+  "SE - EV - RIALTO HS": { wai_school: "Rialto High School", active: true }
+  "CS - TRI CITY CS": { wai_school: "TriCity CDS", active: true }
+  "SE - DM - VICTOR VALLEY SR": { wai_school: "Victor Valley Sr", active: true }
+  "CS - VICTORVILLE EDUCATION CENTER SECOND PROGRAM": { wai_school: "Victorville Education Center", active: true }
+  "CS - VICTOR EDUCATION  ELEM PROGRAM": { wai_school: "Victorville Education Center", active: true }
+  "SE - DM - VISION ALT LEARNING ACADEMY": { wai_school: "Vision Alt. Learning Academy", active: true }
+  "CS - VISION CS": { wai_school: "Vision CDS", active: true }
+  "CS - YOUTH JUSTICE CENTER": { wai_school: "Youth Justice Center CDS", active: false }
+  "CS - YUCCA VALLEY CS": { wai_school: "Yucca CDS", active: true }

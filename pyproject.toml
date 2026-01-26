@@ -1,0 +1,15 @@
+[project]
+name = "workabili-bot3000"
+version = "0.1.0"
+description = "Automation tool for Workability workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = []
+
+[tool.setuptools]
+packages = ["app"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
