@@ -10,6 +10,9 @@ Workability-related workflows through a simple GUI and rules in config.yaml.
 > rules, and WAI field values are all SBCSS-specific. Running it unconfigured against
 > another org's WAI instance will produce incorrect results.
 >
+> `Workabili-Bot3000.vbs` also contains a hardcoded path to `pythonw.exe` that must
+> be updated to match the Python installation path on your machine.
+>
 > Please reach out before attempting to use this: Derek.Carlson@sbcss.net
 
 This project is under active development and is not even alpha yet, so please be careful.
