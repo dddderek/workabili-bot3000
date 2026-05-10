@@ -1,14 +1,24 @@
 district:
   name: "San Bernardino County Superintendent of Schools"
 
+app:
+  version: "0.1.0"
+
 workability:
   login_url: "https://www.caworkability.org/auth"
-  # The name of our district in the Search results page if the student is found
-  owning_org_name: "San Bernardino County Alternative Education"
+  # Names that indicate a found student is already with us in the Search results page.
+  # WAI has used both labels in different places/times; keep current name first.
+  owning_org_names:
+    - "San Bernardino County Office of Education"
+    - "San Bernardino County Alternative Education"
+  # Backward-compatible fallback for older code/config references.
+  owning_org_name: "San Bernardino County Office of Education"
   # Used ONLY on the search screen
   search_project: "Any WAI Project"
   # Used ONLY when creating a new student
   create_project: "San Bernardino County Alternative Education (236-05)"
+  # Used ONLY by the prior-year Transfer modal
+  transfer_to_project: "San Bernardino County Office of Education (236-05)"
 
 credentials:
   # Optional convenience; user can still be prompted at runtime if blank.
@@ -48,7 +58,10 @@ trace:
 
 validation:
   require_ssid: true
+  min_age_years: 13
   allowed_gender: ["M", "F", "N"]
+  allowed_grades: ["7", "8", "9", "10", "11", "12"]
+  allowed_ethcd: ["Y", "N"]
   # If disability is blank / "No Disability" / "EMD" / or otherwise unmapped, skip + log.
   skip_if_disability_missing_or_invalid: true
 
@@ -57,6 +70,12 @@ user_messages:
   ALREADY_OWNED: "🏫 Already with your district"
   TRANSFER_REQUESTED: "📨 Transfer requested"
   TRANSFER_PENDING: "⏳ Transfer pending — awaiting approval"
+  TRANSFERRED_PRIOR_YEAR: "📨 Prior-year record transferred"
+  SERVE_DRY_RUN_FILLED: "✅ Serve dry-run filled"
+  SERVE_SAVED: "✅ Serve saved"
+  SERVE_SKIPPED_NOT_OWNED: "⏭️ Serve skipped — not with your district"
+  SERVE_NOT_FOUND: "⚠️ Serve skipped — student not found"
+  SERVE_ERROR: "❌ Serve error — see details"
   SKIPPED_RESUME: "⏭️ Already processed earlier"
   SKIPPED_MISSING_SSID: "⚠️ Missing SSID — skipped"
   NEEDS_INPUT_DATA: "⚠️ Missing/invalid required data — skipped"
@@ -91,7 +110,7 @@ grade_mapping:
   "17": "Ungraded"
 
 disability_mapping:
-  "Intellectual Disability (ID)": "Intellectual Disability (ID)"
+  "Intellectual Disability (ID)": "Intellectually Disabled (ID)"
   "Hard of Hearing (HH)": "Hard of Hearing (HH)"
   "Deafness (DEAF)/Hearing Impairment (HI)": "Deafness (DEAF)"
   "Speech or Language Impairment (SLI)": "Speech or Language Impairment (SLI)"
@@ -120,6 +139,7 @@ race_mapping:
   "Cambodian": "Cambodian"
   "Hmong": "Hmong"
   "Other Asian": "Other Asian"
+  "Asian Indian:": "Other Asian"
   "Hawaiian": "Hawaiian"
   "Guamanian": "Guamanian"
   "Samoan": "Samoan"
@@ -132,28 +152,47 @@ race_mapping:
 
 school_mapping:
   # Aeries Site Name -> WAI School dropdown (preferred canonical choice) + active flag
-  "SE - DM - AV COUNTY SPEC ED  CENTER": { wai_school: "Apple Valley Alt Ed Center", active: true }
-  "CS - BARBARA PHELPS CS": { wai_school: "Barbara Phelps CHS", active: true }
-  "SE - DM - BARSTOW JH": { wai_school: "Barstow JH", active: true }
-  "CS - BOB MURPHY CS": { wai_school: "Bob Murphy CDS", active: true }
-  "CS - CHAFFEY NORTH CS": { wai_school: "Chaffey North CDS", active: false }
-  "CS - CHAFFEY WEST CS": { wai_school: "David Stine Chaffey West CDS", active: true }
-  "SE - DM - HESPERIA SR": { wai_school: "DM-Hesperia SR", active: true }
-  "SE - DM - SULTANA": { wai_school: "DM-Sultana", active: true }
-  "CS - DOROTHY GIBSON CS": { wai_school: "Dorothy Gibson County High School", active: true }
-  "JCS - EAST VALLEY JUV COURT SCHOOL": { wai_school: "East Valley JCS", active: true }
-  "CS - INDEPENDENT LEARNING ACADEMY (ILA)": { wai_school: "Independent Alternative Education (ILA)", active: true }
-  "SE - EV - EISENHOWER HS": { wai_school: "Eisenhower HS", active: true }
-  "JCS - GATEWAY CENTRAL": { wai_school: "Gateway", active: false }
-  "SE - DM - GRANITE HILL": { wai_school: "Granite Hills", active: true }
-  "SE - DM - NORMA COVERT": { wai_school: "Norma Covert CS", active: true }
-  "SE - EV - REDLANDS EAST VALLEY HS": { wai_school: "Redlands East Valley", active: true }
-  "SE - EV - RIALTO HS": { wai_school: "Rialto High School", active: true }
-  "CS - TRI CITY CS": { wai_school: "TriCity CDS", active: true }
-  "SE - DM - VICTOR VALLEY SR": { wai_school: "Victor Valley Sr", active: true }
-  "CS - VICTORVILLE EDUCATION CENTER SECOND PROGRAM": { wai_school: "Victorville Education Center", active: true }
-  "CS - VICTOR EDUCATION  ELEM PROGRAM": { wai_school: "Victorville Education Center", active: true }
-  "SE - DM - VISION ALT LEARNING ACADEMY": { wai_school: "Vision Alt. Learning Academy", active: true }
-  "CS - VISION CS": { wai_school: "Vision CDS", active: true }
-  "CS - YOUTH JUSTICE CENTER": { wai_school: "Youth Justice Center CDS", active: false }
-  "CS - YUCCA VALLEY CS": { wai_school: "Yucca CDS", active: true }
+  "SE - DM - AV COUNTY SPEC ED  CENTER": { wai_school: "Apple Valley Alt Ed Center (San Bernardino County Office of Education)", active: true }
+  "CS - BARBARA PHELPS CS": { wai_school: "Barbara Phelps CHS (San Bernardino County Office of Education)", active: true }
+  "SE - DM - BARSTOW JH": { wai_school: "Barstow JH (San Bernardino County Office of Education)", active: true }
+  "CS - BOB MURPHY CS": { wai_school: "Bob Murphy CDS (San Bernardino County Office of Education)", active: true }
+  "CS - CHAFFEY NORTH CS": { wai_school: "Chaffey North CDS (San Bernardino County Office of Education)", active: false }
+  "CS - CHAFFEY WEST CS": { wai_school: "David Stine Chaffey West CDS (San Bernardino County Office of Education)", active: true }
+  "SE - DM - HESPERIA SR": { wai_school: "DM-Hesperia SR (San Bernardino County Office of Education)", active: true }
+  "SE - DM - SULTANA": { wai_school: "DM-Sultana (San Bernardino County Office of Education)", active: true }
+  "CS - DOROTHY GIBSON CS": { wai_school: "Dorothy Gibson County High School (San Bernardino County Office of Education)", active: true }
+  "JCS - EAST VALLEY JUV COURT SCHOOL": { wai_school: "East Valley JCS (San Bernardino County Office of Education)", active: true }
+  "CS - INDEPENDENT LEARNING ACADEMY (ILA)": { wai_school: "Independent Alternative Education (ILA) (San Bernardino County Office of Education)", active: true }
+  "SE - EV - EISENHOWER HS": { wai_school: "Eisenhower HS (San Bernardino County Office of Education)", active: true }
+  "JCS - GATEWAY CENTRAL": { wai_school: "Gateway (San Bernardino County Office of Education)", active: false }
+  "SE - DM - GRANITE HILL": { wai_school: "Granite Hills (San Bernardino County Office of Education)", active: true }
+  "SE - DM - NORMA COVERT": { wai_school: "Norma Covert CS (San Bernardino County Office of Education)", active: true }
+  "SE - EV - REDLANDS EAST VALLEY HS": { wai_school: "Redlands East Valley (San Bernardino County Office of Education)", active: true }
+  "SE - EV - RIALTO HS": { wai_school: "Rialto High School (San Bernardino County Office of Education)", active: true }
+  "SE - EV - RIALTO HS 2": { wai_school: "Rialto High School (San Bernardino County Office of Education)", active: true }
+  "CS - TRI CITY CS": { wai_school: "TriCity CDS (San Bernardino County Office of Education)", active: true }
+  "SE - DM - VICTOR VALLEY SR": { wai_school: "Victor Valley Sr (San Bernardino County Office of Education)", active: true }
+  "CS - VICTORVILLE EDUCATION CENTER SECOND PROGRAM": { wai_school: "Victorville Education Center (San Bernardino County Office of Education)", active: true }
+  "CS - VICTOR EDUCATION  ELEM PROGRAM": { wai_school: "Victorville Education Center (San Bernardino County Office of Education)", active: true }
+  "SE - DM - VISION ALT LEARNING ACADEMY": { wai_school: "Vision Alt. Learning Academy (San Bernardino County Office of Education)", active: true }
+  "CS - VISION CS": { wai_school: "Vision CDS (San Bernardino County Office of Education)", active: true }
+  "CS - YOUTH JUSTICE CENTER": { wai_school: "Youth Justice Center CDS (San Bernardino County Office of Education)", active: false }
+  "CS - YUCCA VALLEY CS": { wai_school: "Yucca CDS (San Bernardino County Office of Education)", active: true }
+  "SE - DM - COBALT IMS": { wai_school: "Cobalt IMS (San Bernardino County Office of Education)", active: true }
+  "SE - DM - HESPERIA STAR": { wai_school: "Hesperia STAR (San Bernardino County Office of Education)", active: true }
+  "SE - DM - LUCERNE SR": { wai_school: "Lucerne Sr (San Bernardino County Office of Education)", active: true }
+  "SE - DM - MELVA  DAVIS ACADEMY OF EXCELLENCE": { wai_school: "Melva Davis Academy of Excellence (San Bernardino County Office of Education)", active: true }
+  "SE - DM - MELVA DAVIS ACADEMY OF EXCELLENCE": { wai_school: "Melva Davis Academy of Excellence (San Bernardino County Office of Education)", active: true }
+  "SE - DM - NEEDLES SR": { wai_school: "Needles Sr (San Bernardino County Office of Education)", active: true }
+  "SE - DM - OAK HILLS HS": { wai_school: "Oak Hills HS (San Bernardino County Office of Education)", active: true }
+  "SE - DM - SERRANO": { wai_school: "Serrano (San Bernardino County Office of Education)", active: true }
+  "SE - EV - COLTON HS": { wai_school: "Colton HS (San Bernardino County Office of Education)", active: true }
+  "SE - EV - COLTON HS 2": { wai_school: "Colton HS (San Bernardino County Office of Education)", active: true }
+  "SE - HOME HOSPITAL": { wai_school: "Home Hospital (San Bernardino County Office of Education)", active: true }
+  "SE - WE - ALTA LOMA HS": { wai_school: "Alta Loma HS (San Bernardino County Office of Education)", active: true }
+  "SE - WE - CHINO HS": { wai_school: "Chino HS (San Bernardino County Office of Education)", active: true }
+  "SE - WE - COLONY HS": { wai_school: "Colony HS (San Bernardino County Office of Education)", active: true }
+  "SE - WE - LOS OSOS HS": { wai_school: "Los Osos HS (San Bernardino County Office of Education)", active: true }
+  "SE - WE - RANCHO CUC HS": { wai_school: "Rancho Cucamonga HS (San Bernardino County Office of Education)", active: true }
+  "SE - WE - UPLAND HS": { wai_school: "Upland HS (San Bernardino County Office of Education)", active: true }
+  

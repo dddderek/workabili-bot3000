@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtMultimedia import QSoundEffect
 
-from app.runner import run as run_runner
+from app.runner import run as run_runner, run_serve as run_serve_runner
 
 
 CONFIG_PATH = os.path.join("config", "config.yaml")
@@ -280,6 +280,7 @@ class RunArgs:
     username: str
     password: str
     headless: bool
+    mode: str = "enroll_transfer"
 
 
 class MainWindow(QMainWindow):
@@ -337,7 +338,7 @@ class MainWindow(QMainWindow):
             self._details_btn.setText("Details")
         self.resize(self.width(), self._collapsed_h)
 
-        self._append_status("Ready. 👇 Pick your Excel file and hit Run.  Let's do this.\n")
+        self._append_status("Ready. 👇 Pick your Excel file, then choose Enroll / Transfer or Serve.\n")
 
 
         # Global click detection (disabled buttons don't receive events)
@@ -404,6 +405,12 @@ class MainWindow(QMainWindow):
                 title.setFont(QFont("Segoe UI", 22, QFont.Bold))
 
         header_row.addWidget(title)
+        version = str(self.cfg.get("app", {}).get("version", "0.1.0") or "0.1.0").strip()
+        version_lbl = QLabel(f"v{version}")
+        version_lbl.setStyleSheet("QLabel { color: #94a3b8; background: transparent; }")
+        version_lbl.setFont(QFont("Segoe UI", 8, QFont.Medium))
+        version_lbl.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
+        header_row.addWidget(version_lbl)
 
         badge = QLabel("🤖  Modern WAI student uploader")
         badge.setStyleSheet(
@@ -556,9 +563,13 @@ class MainWindow(QMainWindow):
         controls_card.setMaximumWidth(520)
         left_col.addWidget(controls_card)
 
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        controls_card.layout().addLayout(row)
+        primary_row = QHBoxLayout()
+        primary_row.setSpacing(10)
+        controls_card.layout().addLayout(primary_row)
+
+        secondary_row = QHBoxLayout()
+        secondary_row.setSpacing(10)
+        controls_card.layout().addLayout(secondary_row)
 
         BTN_H = 42
         BTN_RADIUS = 12
@@ -619,17 +630,27 @@ class MainWindow(QMainWindow):
         QPushButton:pressed { border: 1px solid #ef4444; }
         """
 
-        # --- Run (Primary) ---
-        self.btn_run = QPushButton("Run")
+        # --- Enroll / Transfer (Primary) ---
+        self.btn_run = QPushButton("Enroll / Transfer")
         self.btn_run.setFont(BTN_FONT)
         self.btn_run.setStyleSheet(primary_btn_css)
         self.btn_run.setFixedHeight(BTN_H)
         self.btn_run.clicked.connect(self._on_run_clicked)
-        self.btn_run.setToolTip("Run the upload process.")
+        self.btn_run.setToolTip("Enroll new students and request or complete transfers.")
 
         # Use built-in Qt icon (crisp, not pixel glyph)
         self.btn_run.setIcon(self._icon_from_svg(self._svg_with_color(self.LUCIDE_PLAY, "#ffffff"), 18))
         self.btn_run.setIconSize(QSize(18, 18))
+
+        # --- Serve (Primary) ---
+        self.btn_serve = QPushButton("Serve")
+        self.btn_serve.setFont(BTN_FONT)
+        self.btn_serve.setStyleSheet(primary_btn_css)
+        self.btn_serve.setFixedHeight(BTN_H)
+        self.btn_serve.clicked.connect(self._on_serve_clicked)
+        self.btn_serve.setToolTip("Dry-run the Array of Services serve workflow.")
+        self.btn_serve.setIcon(self._icon_from_svg(self._svg_with_color(self.LUCIDE_PLAY, "#ffffff"), 18))
+        self.btn_serve.setIconSize(QSize(18, 18))
 
         # --- Stop (Muted Amber) ---
         self.btn_stop = QPushButton("Stop")
@@ -690,12 +711,14 @@ class MainWindow(QMainWindow):
 
         # Equal widths
         self.btn_run.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_serve.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.btn_stop.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.btn_quit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        row.addWidget(self.btn_run, stretch=1)
-        row.addWidget(self.btn_stop, stretch=1)
-        row.addWidget(self.btn_quit, stretch=1)
+        primary_row.addWidget(self.btn_run, stretch=1)
+        primary_row.addWidget(self.btn_serve, stretch=1)
+        secondary_row.addWidget(self.btn_stop, stretch=1)
+        secondary_row.addWidget(self.btn_quit, stretch=1)
 
         left_col.addStretch(1)
 
@@ -833,8 +856,12 @@ class MainWindow(QMainWindow):
     def _update_excel_path_labels(self):
         full = self._excel_path or ""
 
-        # Tooltips always show the full path
-        self.excel_path_lbl.setToolTip(full)
+        if full:
+            self.excel_path_lbl.setToolTip(full)
+            self.excel_path_lbl.unsetCursor()
+        else:
+            self.excel_path_lbl.setToolTip("Click to select an input Excel file.")
+            self.excel_path_lbl.setCursor(Qt.PointingHandCursor)
         self.top_excel_path_lbl.setToolTip(full)
 
         # Boss-tier copy affordance
@@ -866,6 +893,15 @@ class MainWindow(QMainWindow):
     # -------------------------
     def eventFilter(self, obj, event):
         if event.type() == QEvent.MouseButtonPress:
+            if (
+                obj is getattr(self, "excel_path_lbl", None)
+                and not (self._excel_path or "").strip()
+                and getattr(self, "btn_browse", None)
+                and self.btn_browse.isEnabled()
+            ):
+                self._browse_excel()
+                return True
+
             try:
                 gp = event.globalPosition().toPoint()  # Qt6
             except Exception:
@@ -877,7 +913,7 @@ class MainWindow(QMainWindow):
             if gp is not None:
                 # If user clicks a disabled button area, show a toast near the click.
                 # (Disabled widgets won't receive their own mouse events.)
-                for btn in [getattr(self, "btn_run", None), getattr(self, "btn_stop", None)]:
+                for btn in [getattr(self, "btn_run", None), getattr(self, "btn_serve", None), getattr(self, "btn_stop", None)]:
                     if not btn:
                         continue
                     if btn.isEnabled():
@@ -1204,7 +1240,7 @@ class MainWindow(QMainWindow):
         self._shake_anim = anim
         anim.start()
 
-    def _validate_inputs(self) -> RunArgs | None:
+    def _validate_inputs(self, mode: str = "enroll_transfer") -> RunArgs | None:
         excel_path = (self._excel_path or "").strip()
         username = self.user_edit.text().strip()
         password = self.pass_edit.text()
@@ -1232,6 +1268,7 @@ class MainWindow(QMainWindow):
             username=username,
             password=password,
             headless=self.headless_chk.isChecked(),
+            mode=mode,
         )
 
     # -------------------------
@@ -1464,19 +1501,29 @@ class MainWindow(QMainWindow):
         return result == QDialog.Accepted
 
     def _on_run_clicked(self):
-        args = self._validate_inputs()
+        args = self._validate_inputs(mode="enroll_transfer")
         if not args:
             return
 
         if not self._show_run_preflight():
             return
 
+        self._start_workflow(args, "Enroll / Transfer")
+
+    def _on_serve_clicked(self):
+        args = self._validate_inputs(mode="serve")
+        if not args:
+            return
+
+        self._start_workflow(args, "Serve")
+
+    def _start_workflow(self, args: RunArgs, workflow_label: str):
         self._stop_event.clear()
         self.bus.state_running.emit(True)
 
         # User-facing run header
         self._run_start_dt = datetime.now()
-        self.bus.user_msg.emit(f"▶️ Run started at {self._hm_ampm()}")
+        self.bus.user_msg.emit(f"▶️ {workflow_label} started at {self._hm_ampm()}")
 
         # Ensure we have a student count (Browse sets this; fallback counts silently)
         if getattr(self, "_loaded_students_count", 0) <= 0 and args.excel_path:
@@ -1489,6 +1536,7 @@ class MainWindow(QMainWindow):
         # Headless login can feel like a freeze — show a subtle heartbeat
         self._busy_start("⏳ Logging in")
 
+        self.bus.dev_msg.emit(f"Mode: {args.mode}")
         self.bus.dev_msg.emit(f"Excel: {args.excel_path}")
         self.bus.dev_msg.emit(f"Headless: {args.headless}")
 
@@ -1580,10 +1628,16 @@ class MainWindow(QMainWindow):
                     "ALREADY_OWNED",
                     "TRANSFER_REQUESTED",
                     "TRANSFER_PENDING",
+                    "TRANSFERRED_PRIOR_YEAR",
+                    "SERVE_DRY_RUN_FILLED",
+                    "SERVE_SAVED",
+                    "SERVE_SKIPPED_NOT_OWNED",
+                    "SERVE_NOT_FOUND",
                     "SKIPPED_RESUME",
                     "SKIPPED_MISSING_SSID",
                     "NEEDS_INPUT_DATA",
                     "ERROR",
+                    "SERVE_ERROR",
                 }:
                     self.bus.busy_stop.emit()
                 self.bus.user_msg.emit(self._user_message_for_state(state, **ctx))
@@ -1594,7 +1648,12 @@ class MainWindow(QMainWindow):
         try:
             # NOTE: Stop button requires a tiny runner.py addition (cooperative cancel).
             # For now we pass stop_event; your runner will need to check it between steps.
-            summary = run_runner(
+            runner_fn = run_serve_runner if args.mode == "serve" else run_runner
+            runner_kwargs = {}
+            if args.mode == "serve":
+                runner_kwargs["save_after_fill"] = True
+
+            summary = runner_fn(
                 excel_path=args.excel_path,
                 config_path=CONFIG_PATH,
                 username=args.username,
@@ -1603,6 +1662,7 @@ class MainWindow(QMainWindow):
                 override_headless=args.headless,
                 stop_event=self._stop_event,    # <-- requires runner to accept + check
                 user_log_fn=user_log,           # <-- requires runner to emit user-friendly messages
+                **runner_kwargs,
             )
             self.bus.finished_ok.emit(summary or {})
 
@@ -1615,6 +1675,8 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _set_running_state(self, running: bool):
         self.btn_run.setEnabled(not running)
+        if hasattr(self, "btn_serve"):
+            self.btn_serve.setEnabled(not running)
         self.btn_browse.setEnabled(not running)
         self.excel_path_lbl.setEnabled(not running)
         self.top_excel_path_lbl.setEnabled(not running)
@@ -1689,7 +1751,19 @@ class MainWindow(QMainWindow):
             self._require_password_change = True
             self.btn_run.setEnabled(False)
             self.btn_run.setToolTip("Please re-enter your password and then this button will become clickable.")
+            if hasattr(self, "btn_serve"):
+                self.btn_serve.setEnabled(False)
+                self.btn_serve.setToolTip("Please re-enter your password and then this button will become clickable.")
 
+            return
+
+        if "SERVE_LAYOUT_CHANGED" in err:
+            self._modal_error(
+                "WAI Page Layout Changed",
+                "The WAI Array of Services page no longer matches the expected row or column labels.\n\n"
+                "The Serve workflow has been halted so it does not write to the wrong boxes.\n\n"
+                f"Details:\n{err}",
+            )
             return
 
         self._modal_error("Workabili-Bot3000", f"Run failed:\n\n{err}")
@@ -1702,7 +1776,10 @@ class MainWindow(QMainWindow):
                 # Re-enable Run only if we're not running
                 if not self.btn_stop.isEnabled():
                     self.btn_run.setEnabled(True)
-                    self.btn_run.setToolTip("Run the upload process.")
+                    self.btn_run.setToolTip("Enroll new students and request or complete transfers.")
+                    if hasattr(self, "btn_serve"):
+                        self.btn_serve.setEnabled(True)
+                        self.btn_serve.setToolTip("Dry-run the Array of Services serve workflow.")
 
     def _svg_with_color(self, svg: str, color_hex: str) -> str:
         # Lucide uses stroke="currentColor"; we replace with an explicit stroke color
@@ -1747,10 +1824,15 @@ class MainWindow(QMainWindow):
         n_created = int(summary.get("created", 0))
         n_tr_req = int(summary.get("transfer_requested", 0))
         n_tr_pend = int(summary.get("transfer_pending", 0))
+        n_tr_prior = int(summary.get("transferred_prior_year", 0))
         n_owned = int(summary.get("already_owned", 0))
         n_skipped = int(summary.get("skipped", 0))
         n_errors = int(summary.get("errors", 0))
         n_stopped = int(summary.get("stopped", 0))
+        n_serve_filled = int(summary.get("serve_dry_run_filled", 0))
+        n_serve_saved = int(summary.get("serve_saved", 0))
+        n_serve_not_owned = int(summary.get("serve_skipped_not_owned", 0))
+        n_serve_not_found = int(summary.get("serve_not_found", 0))
 
         # Headline + vibe
         headline = "✅ SUCCESS!"
@@ -1786,11 +1868,24 @@ class MainWindow(QMainWindow):
             <b>✅ Created:</b> {n_created}<br>
             <b>📨 Transfer requested:</b> {n_tr_req}<br>
             <b>⏳ Transfer pending:</b> {n_tr_pend}<br>
+            <b>📨 Prior-year transferred:</b> {n_tr_prior}<br>
             <b>🏫 Already with us:</b> {n_owned}<br>
             <b>⏭️ Already processed:</b> {n_skipped}<br>
             <b>❌ Errors:</b> {n_errors}
             </div>
         """)
+
+        if n_serve_filled or n_serve_saved or n_serve_not_owned or n_serve_not_found:
+            box.setInformativeText(f"""
+                <div style="font-size:14px; line-height:1.7;">
+                <b>Students in input file:</b> {n_total}<br>
+                <b>✅ Serve saved:</b> {n_serve_saved}<br>
+                <b>⏭️ Not with us:</b> {n_serve_not_owned}<br>
+                <b>⚠️ Not found:</b> {n_serve_not_found}<br>
+                <b>⏭️ Invalid/skipped input:</b> {n_skipped}<br>
+                <b>❌ Errors:</b> {n_errors}
+                </div>
+            """)
 
         # Make it feel premium
         box.setStyleSheet("""
@@ -1951,11 +2046,15 @@ class MainWindow(QMainWindow):
             run_rows = [r for r in all_rows if (r.get("run_id") or "").strip() == run_id]
 
             # Transfers: this run
-            transfers_run = [r for r in run_rows if (r.get("action") in ("TRANSFER_REQUESTED", "TRANSFER_PENDING"))]
+            transfers_run = [r for r in run_rows if (r.get("action") in ("TRANSFER_REQUESTED", "TRANSFER_PENDING", "TRANSFERRED_PRIOR_YEAR"))]
 
-            # Transfers: all open (dedup latest transfer state per SSID)
-            transfers_all = [r for r in all_rows if (r.get("action") in ("TRANSFER_REQUESTED", "TRANSFER_PENDING"))]
-            transfers_open = self._latest_by_ssid(transfers_all)
+            # Transfers: all open. Dedup across all ledger rows first so later
+            # resolved states remove older transfer requests from the open list.
+            latest_all = self._latest_by_ssid(all_rows)
+            transfers_open = [
+                r for r in latest_all
+                if (r.get("action") in ("TRANSFER_REQUESTED", "TRANSFER_PENDING"))
+            ]
 
             dlg = RunResultsDialog(
                 parent=self,
@@ -2064,6 +2163,12 @@ class RunResultsDialog(QDialog):
         "ALREADY_OWNED": "🏫 Already with us",
         "TRANSFER_REQUESTED": "📨 Transfer requested",
         "TRANSFER_PENDING": "⏳ Transfer pending",
+        "TRANSFERRED_PRIOR_YEAR": "📨 Prior-year transferred",
+        "SERVE_DRY_RUN_FILLED": "✅ Serve dry-run filled",
+        "SERVE_SAVED": "✅ Serve saved",
+        "SERVE_SKIPPED_NOT_OWNED": "⏭️ Serve skipped - not with us",
+        "SERVE_NOT_FOUND": "⚠️ Serve skipped - not found",
+        "SERVE_ERROR": "❌ Serve error",
         "SKIPPED_RESUME": "⏭️ Already processed",
         "SKIPPED_MISSING_SSID": "⚠️ Missing SSID — skipped",
         "NEEDS_INPUT_DATA": "⚠️ Missing/invalid required data — skipped",
@@ -2091,6 +2196,7 @@ class RunResultsDialog(QDialog):
             "created": int(self.summary.get("created", 0)),
             "transfer_requested": int(self.summary.get("transfer_requested", 0)),
             "transfer_pending": int(self.summary.get("transfer_pending", 0)),
+            "transferred_prior_year": int(self.summary.get("transferred_prior_year", 0)),
             "already_owned": int(self.summary.get("already_owned", 0)),
             "skipped": int(self.summary.get("skipped", 0)),
             "errors": int(self.summary.get("errors", 0)),
@@ -2102,7 +2208,7 @@ class RunResultsDialog(QDialog):
 
         strip = QLabel(
             f"<b>✅ Created:</b> {counts['created']} &nbsp;&nbsp; "
-            f"<b>📨+⏳ Transfers:</b> {counts['transfer_requested'] + counts['transfer_pending']} &nbsp;&nbsp; "
+            f"<b>📨+⏳ Transfers:</b> {counts['transfer_requested'] + counts['transfer_pending'] + counts['transferred_prior_year']} &nbsp;&nbsp; "
             f"<b>🏫 Already with us:</b> {counts['already_owned']} &nbsp;&nbsp; "
             f"<b>⏭️ Skipped:</b> {counts['skipped']} &nbsp;&nbsp; "
             f"<b>❌ Errors:</b> {counts['errors']}"
@@ -2136,10 +2242,11 @@ class RunResultsDialog(QDialog):
         self._tab_map = {}
 
         self._add_table_tab("Created", self._filter_run(action="CREATED"))
+        self._add_table_tab("Served", self._filter_run(actions={"SERVE_DRY_RUN_FILLED", "SERVE_SAVED", "SERVE_SKIPPED_NOT_OWNED", "SERVE_NOT_FOUND"}))
         self._add_transfers_tab()
         self._add_table_tab("Already With Us", self._filter_run(action="ALREADY_OWNED"))
         self._add_table_tab("Skipped", self._filter_run(actions={"SKIPPED_RESUME", "SKIPPED_MISSING_SSID", "NEEDS_INPUT_DATA"}))
-        self._add_table_tab("Errors", self._filter_run(action="ERROR"))
+        self._add_table_tab("Errors", self._filter_run(actions={"ERROR", "SERVE_ERROR"}))
         self._add_table_tab("All", self._filter_run(actions=None))
 
         # Footer buttons
@@ -2467,7 +2574,7 @@ class RunResultsDialog(QDialog):
         if scope == "All Open Transfers":
             base = list(self.transfers_open_rows)
         else:
-            base = [r for r in self.run_rows if (r.get("action") in ("TRANSFER_REQUESTED", "TRANSFER_PENDING"))]
+            base = [r for r in self.run_rows if (r.get("action") in ("TRANSFER_REQUESTED", "TRANSFER_PENDING", "TRANSFERRED_PRIOR_YEAR"))]
 
         # Add a human status label into details/Category is already there
         filtered = []

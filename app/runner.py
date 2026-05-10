@@ -5,8 +5,9 @@ import csv
 import uuid
 import yaml
 import time
+import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from getpass import getpass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -146,7 +147,7 @@ def click_save_robust(
 
     # 3) Scroll into view (some layouts require this)
     try:
-        save_btn.scroll_into_view_if_needed(timeout=300)
+        save_btn.scroll_into_view_if_needed(timeout=3000)
     except Exception:
         pass
 
@@ -194,8 +195,8 @@ def load_ledger_state_xlsx(ledger_path: str) -> Tuple[Set[str], Dict[str, str], 
     Returns:
       completed: SSIDs that are terminal and should be skipped on resume
       last_action_by_ssid: last recorded action for each SSID (for SKIPPED_RESUME details)
-      transfer_requested_ssids: SSIDs that have ever had TRANSFER_REQUESTED logged
-        (used to emit TRANSFER_PENDING and avoid re-clicking envelope due to UI inconsistency)
+      transfer_requested_ssids: legacy return value; transfer actions are no longer
+        treated as terminal because released students must be rechecked live.
     """
     completed: Set[str] = set()
     last_action_by_ssid: Dict[str, str] = {}
@@ -229,16 +230,13 @@ def load_ledger_state_xlsx(ledger_path: str) -> Tuple[Set[str], Dict[str, str], 
         if action:
             last_action_by_ssid[ssid] = action
 
-        if action in {"TRANSFER_REQUESTED", "TRANSFER_PENDING"}:
-            transfer_requested_ssids.add(ssid)
-
-        # Terminal outcomes (including transfers, per current workflow intent)
+        # Terminal outcomes. Transfer requests/pending are intentionally not terminal:
+        # a later run may find that the releasing org has approved the transfer.
         if action in {
             "CREATED",
             "ALREADY_OWNED",
             "SKIPPED_MISSING_SSID",
-            "TRANSFER_REQUESTED",
-            "TRANSFER_PENDING",
+            "TRANSFERRED_PRIOR_YEAR",
         }:
             completed.add(ssid)
 
@@ -300,6 +298,25 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def append_text_log(path: str, msg: str) -> None:
+    ensure_dir(os.path.dirname(path))
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(msg.rstrip() + "\n")
+
+
+def log_input_audit(path: str, run_id: str, msg: str, log_fn=None) -> None:
+    stamped = f"[{run_id}] {msg}"
+    _log(log_fn, stamped)
+    append_text_log(path, f"{datetime.utcnow().isoformat()} {stamped}")
+
+
+def make_input_audit_logger(path: str, run_id: str, log_fn=None):
+    def _audit(msg: str) -> None:
+        log_input_audit(path, run_id, msg, log_fn=log_fn)
+
+    return _audit
+
+
 def get_found_row_owning_org(page, expected_ssid: str, timeout_ms: int = 5000) -> str:
     row = page.locator("tr").filter(has_text=re.compile(re.escape(expected_ssid))).first
     row.wait_for(state="visible", timeout=timeout_ms)
@@ -319,8 +336,17 @@ def get_found_row_owning_org(page, expected_ssid: str, timeout_ms: int = 5000) -
 
 
 def is_already_owned_by_us(found_owning_org: str, cfg: Dict[str, Any]) -> bool:
-    target = norm(cfg["workability"]["owning_org_name"])
-    return norm(found_owning_org).lower() == target.lower()
+    found = norm(found_owning_org).casefold()
+    if not found:
+        return False
+
+    workability_cfg = cfg.get("workability", {}) or {}
+    targets = workability_cfg.get("owning_org_names")
+
+    if not targets:
+        targets = [workability_cfg.get("owning_org_name", "")]
+
+    return any(found == norm(target).casefold() for target in targets if norm(target))
 
 
 def _log(log_fn, msg: str) -> None:
@@ -338,21 +364,168 @@ def norm(s: Any) -> str:
     return " ".join(str(s or "").strip().split())
 
 
+EXCEL_ROW_NUM_KEY = "__excel_row_num__"
+
+
+def school_lookup_key(s: Any) -> str:
+    return norm(s).upper()
+
+
+EXCEL_TEXT_REPLACEMENTS = {
+    "\u00a0": (" ", "converted nonbreaking spaces"),
+    "\u2007": (" ", "converted nonstandard spaces"),
+    "\u202f": (" ", "converted nonstandard spaces"),
+    "\u2018": ("'", "normalized smart apostrophes"),
+    "\u2019": ("'", "normalized smart apostrophes"),
+    "\u201a": ("'", "normalized smart apostrophes"),
+    "\u201b": ("'", "normalized smart apostrophes"),
+    "\u2032": ("'", "normalized prime/apostrophe-like marks"),
+    "\u2035": ("'", "normalized prime/apostrophe-like marks"),
+    "\u201c": ('"', "normalized smart quotes"),
+    "\u201d": ('"', "normalized smart quotes"),
+    "\u201e": ('"', "normalized smart quotes"),
+    "\u201f": ('"', "normalized smart quotes"),
+    "\u2033": ('"', "normalized quote-like marks"),
+}
+
+EXCEL_TEXT_REMOVALS = {
+    "\u200b": "removed zero-width characters",
+    "\u200c": "removed zero-width characters",
+    "\u200d": "removed zero-width characters",
+    "\ufeff": "removed byte-order marks",
+}
+
+
+def sanitize_excel_text(value: str) -> Tuple[str, List[str]]:
+    cleaned_chars = []
+    changes = set()
+
+    for ch in value:
+        replacement = EXCEL_TEXT_REPLACEMENTS.get(ch)
+        if replacement:
+            new_ch, reason = replacement
+            cleaned_chars.append(new_ch)
+            changes.add(reason)
+            continue
+
+        removal_reason = EXCEL_TEXT_REMOVALS.get(ch)
+        if removal_reason:
+            changes.add(removal_reason)
+            continue
+
+        if ch in {"\r", "\n", "\t"}:
+            cleaned_chars.append(" ")
+            changes.add("converted tabs/newlines to spaces")
+            continue
+
+        cleaned_chars.append(ch)
+
+    cleaned = "".join(cleaned_chars)
+    collapsed = " ".join(cleaned.strip().split())
+    if collapsed != cleaned:
+        changes.add("trimmed/collapsed whitespace")
+
+    return collapsed, sorted(changes)
+
+
+def sanitize_excel_value(value: Any) -> Tuple[Any, List[str]]:
+    if isinstance(value, str):
+        return sanitize_excel_text(value)
+    return value, []
+
+
+def sanitize_person_name_value(value: Any) -> Tuple[str, List[str]]:
+    if value is None:
+        return "", []
+
+    changes = set()
+    if isinstance(value, str):
+        text, text_changes = sanitize_excel_text(value)
+        changes.update(text_changes)
+    else:
+        text = norm(value)
+
+    cleaned_chars = []
+
+    for ch in unicodedata.normalize("NFKD", text):
+        if unicodedata.combining(ch):
+            changes.add("removed diacritics from name")
+            continue
+
+        if ("A" <= ch <= "Z") or ("a" <= ch <= "z") or ch in {"-", "'", " "}:
+            cleaned_chars.append(ch)
+            continue
+
+        if ch.isspace():
+            cleaned_chars.append(" ")
+            changes.add("normalized name whitespace")
+            continue
+
+        cleaned_chars.append(" ")
+        changes.add("removed unsupported name characters")
+
+    cleaned = " ".join("".join(cleaned_chars).strip().split())
+    tokens = [token.strip("-'") for token in cleaned.split(" ")]
+    stripped = " ".join(token for token in tokens if token)
+    if stripped != cleaned:
+        changes.add("trimmed unsupported name punctuation")
+    cleaned = stripped
+
+    if cleaned != text and not changes:
+        changes.add("normalized name")
+
+    return cleaned, sorted(changes)
+
+
+def _excel_log_value(value: Any, max_len: int = 90) -> str:
+    text = "" if value is None else str(value)
+    escaped = text.encode("unicode_escape", errors="backslashreplace").decode("ascii")
+    if len(escaped) > max_len:
+        return escaped[: max_len - 3] + "..."
+    return escaped
+
+
+def log_excel_sanitization(
+    log_fn,
+    excel_row_num: int,
+    excel_col_num: int,
+    header: str,
+    original: Any,
+    cleaned: Any,
+    changes: List[str],
+) -> None:
+    if not changes:
+        return
+
+    col = get_column_letter(excel_col_num)
+    header_hint = f" ({header})" if header else ""
+    _log(
+        log_fn,
+        "Excel sanitized "
+        f"row {excel_row_num}, column {col}{header_hint}: "
+        f"{'; '.join(changes)}; "
+        f"{_excel_log_value(original)!r} -> {_excel_log_value(cleaned)!r}",
+    )
+
+
 def load_config(config_path: str) -> Dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     sm = cfg.get("school_mapping", {}) or {}
     normalized = {}
+    original_keys = {}
     collisions = {}
 
     for raw_key, val in sm.items():
-        nk = norm(raw_key)
+        nk = school_lookup_key(raw_key)
         if nk in normalized and normalized[nk] != val:
             collisions.setdefault(nk, []).append(raw_key)
         normalized[nk] = val
+        original_keys[nk] = norm(raw_key)
 
     cfg["school_mapping"] = normalized
+    cfg["_school_mapping_original_keys"] = original_keys
 
     if collisions:
         print("WARNING: school_mapping key collisions after normalization:")
@@ -362,39 +535,90 @@ def load_config(config_path: str) -> Dict[str, Any]:
     return cfg
 
 
+def normalized_integral_text(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, bool):
+        return norm(raw)
+    if isinstance(raw, int):
+        return str(raw)
+    if isinstance(raw, float) and raw.is_integer():
+        return str(int(raw))
+    return norm(raw)
+
+
 def map_grade(raw_grade: Any, cfg: Dict[str, Any]) -> Optional[str]:
-    return cfg["grade_mapping"].get(norm(raw_grade))
+    return cfg["grade_mapping"].get(normalized_integral_text(raw_grade))
 
 
 def map_disability(raw_dis: Any, cfg: Dict[str, Any]) -> Optional[str]:
     return cfg["disability_mapping"].get(norm(raw_dis))
 
 
-def map_race(raw_race: Any, cfg: Dict[str, Any]) -> str:
-    return cfg["race_mapping"].get(norm(raw_race), "Other")
+def map_race(raw_race: Any, cfg: Dict[str, Any], validation_log_fn=None, excel_row_num=None) -> str:
+    raw = norm(raw_race)
+    mapped = cfg["race_mapping"].get(raw)
+    if mapped:
+        return mapped
+
+    msg = f"Race value {raw!r} is not in race_mapping; falling back to 'Other'."
+    if excel_row_num:
+        msg = f"Excel row {excel_row_num}: {msg}"
+    if validation_log_fn:
+        _log(validation_log_fn, msg)
+    return "Other"
 
 
-def resolve_school(aeries_site: Any, cfg: Dict[str, Any]) -> str:
-    key = norm(aeries_site)
+def resolve_school(aeries_site: Any, cfg: Dict[str, Any], validation_log_fn=None, excel_row_num=None) -> str:
+    raw = norm(aeries_site)
+    key = school_lookup_key(raw)
     entry = cfg["school_mapping"].get(key)
     if not entry:
         raise KeyError(f"No school mapping for Aeries site raw={aeries_site!r} normalized={key!r}")
     if not entry.get("active", True):
         raise ValueError(f"Mapped WAI school is inactive/closed: {entry.get('wai_school')!r}")
+
+    original_key = (cfg.get("_school_mapping_original_keys") or {}).get(key, key)
+    if raw and raw != original_key:
+        msg = f"School name {raw!r} matched config key {original_key!r} using case-insensitive lookup."
+        if excel_row_num:
+            msg = f"Excel row {excel_row_num}: {msg}"
+        if validation_log_fn:
+            _log(validation_log_fn, msg)
+
     return entry["wai_school"]
 
 
-def normalize_dob_mmddyyyy(raw: Any) -> str:
+def parse_dob(raw: Any) -> date:
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+
     s = norm(raw)
     if not s:
-        return ""
-    parts = s.split("/")
-    if len(parts) != 3:
-        raise ValueError(f"Invalid DOB format (expected M/D/YYYY): {s!r}")
-    m = int(parts[0])
-    d = int(parts[1])
-    y = int(parts[2])
-    return f"{m:02d}/{d:02d}/{y:04d}"
+        raise ValueError("Birthdate is required")
+
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+
+    raise ValueError(f"Invalid DOB format/date {s!r} (expected M/D/YYYY)")
+
+
+def age_on(dob: date, today: date) -> int:
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+
+def normalize_dob_mmddyyyy(raw: Any) -> str:
+    dob = parse_dob(raw)
+    return f"{dob.month:02d}/{dob.day:02d}/{dob.year:04d}"
+
+
+def contains_alpha(s: str) -> bool:
+    return any(ch.isalpha() for ch in s)
 
 
 @dataclass
@@ -412,42 +636,169 @@ class Student:
     wai_school: str
 
 
-def validate_and_prepare(row: Dict[str, Any], cfg: Dict[str, Any]) -> Student:
+@dataclass
+class PreparedInputRow:
+    excel_row_num: int
+    student: Student
+    display_name: str
+
+
+@dataclass
+class InvalidInputRow:
+    excel_row_num: int
+    display_name: str
+    ssid: str
+    action: str
+    details: str
+
+
+def row_display_name(row: Dict[str, Any], cfg: Dict[str, Any]) -> str:
     cols = cfg["columns"]
+    fn = norm(row.get(cols["first_name"]))
+    ln = norm(row.get(cols["last_name"]))
+    return f"{fn} {ln}".strip()
 
-    ssid = norm(row.get(cols["ssid"]))
+
+def validate_and_prepare(
+    row: Dict[str, Any],
+    cfg: Dict[str, Any],
+    validation_log_fn=None,
+    today: date | None = None,
+) -> Student:
+    cols = cfg["columns"]
+    today = today or date.today()
+    excel_row_num = row.get(EXCEL_ROW_NUM_KEY)
+    errors: List[str] = []
+
+    def add_error(msg: str) -> None:
+        errors.append(msg)
+
+    first_name_raw = row.get(cols["first_name"])
+    first_name, first_name_changes = sanitize_person_name_value(first_name_raw)
+    if first_name_changes and validation_log_fn:
+        _log(
+            validation_log_fn,
+            f"Excel row {excel_row_num}: First Name sanitized for WAI name field: "
+            f"{_excel_log_value(first_name_raw)!r} -> {_excel_log_value(first_name)!r} "
+            f"({'; '.join(first_name_changes)}).",
+        )
+    if not first_name:
+        if norm(first_name_raw):
+            add_error("First Name must contain at least one alphabetic character")
+        else:
+            add_error("First Name is required")
+    elif not contains_alpha(first_name):
+        add_error("First Name must contain at least one alphabetic character")
+
+    last_name_raw = row.get(cols["last_name"])
+    last_name, last_name_changes = sanitize_person_name_value(last_name_raw)
+    if last_name_changes and validation_log_fn:
+        _log(
+            validation_log_fn,
+            f"Excel row {excel_row_num}: Last Name sanitized for WAI name field: "
+            f"{_excel_log_value(last_name_raw)!r} -> {_excel_log_value(last_name)!r} "
+            f"({'; '.join(last_name_changes)}).",
+        )
+    if not last_name:
+        if norm(last_name_raw):
+            add_error("Last Name must contain at least one alphabetic character")
+        else:
+            add_error("Last Name is required")
+    elif not contains_alpha(last_name):
+        add_error("Last Name must contain at least one alphabetic character")
+
+    ssid = normalized_integral_text(row.get(cols["ssid"]))
     if not ssid:
-        raise ValueError("Missing SSID")
+        add_error("Missing SSID")
+    elif not re.fullmatch(r"\d{10}", ssid):
+        add_error(f"State Student ID must be exactly 10 digits; got {ssid!r}")
 
-    gender_raw = norm(row.get(cols["gender"]))
-    if gender_raw not in cfg["validation"]["allowed_gender"]:
-        raise ValueError(f"Invalid gender {gender_raw!r} (allowed {cfg['validation']['allowed_gender']})")
-    gender_ui = cfg["gender_mapping"][gender_raw]
+    validation_cfg = cfg.get("validation", {}) or {}
 
-    dob_ui = normalize_dob_mmddyyyy(row.get(cols["dob"]))
+    gender_input = norm(row.get(cols["gender"]))
+    gender_raw = gender_input.upper()
+    allowed_gender = [str(x).upper() for x in validation_cfg.get("allowed_gender", [])]
+    if not gender_raw:
+        add_error("Gender is required")
+    elif gender_raw not in allowed_gender:
+        add_error(f"Invalid gender {gender_input!r} (allowed {allowed_gender})")
+    elif gender_input and gender_input != gender_raw and validation_log_fn:
+        _log(validation_log_fn, f"Excel row {excel_row_num}: Gender {gender_input!r} normalized to {gender_raw!r}.")
+    gender_ui = cfg["gender_mapping"].get(gender_raw, "")
+
+    dob_ui = ""
+    try:
+        dob = parse_dob(row.get(cols["dob"]))
+        min_age_years = int(validation_cfg.get("min_age_years", 13))
+        student_age = age_on(dob, today)
+        if student_age < min_age_years:
+            add_error(f"Birthdate indicates age {student_age}; student must be at least {min_age_years}")
+        dob_ui = f"{dob.month:02d}/{dob.day:02d}/{dob.year:04d}"
+    except ValueError as e:
+        add_error(str(e))
 
     grade_ui = map_grade(row.get(cols["grade"]), cfg)
-    if not grade_ui:
-        raise ValueError(f"Invalid grade {norm(row.get(cols['grade']))!r} (no mapping)")
+    grade_raw = normalized_integral_text(row.get(cols["grade"]))
+    allowed_grades = [str(x) for x in validation_cfg.get("allowed_grades", ["7", "8", "9", "10", "11", "12"])]
+    if not grade_raw:
+        add_error("Grade is required")
+    elif grade_raw not in allowed_grades:
+        add_error(f"Invalid grade {grade_raw!r} (allowed {allowed_grades})")
+    elif not grade_ui:
+        add_error(f"Invalid grade {grade_raw!r} (no mapping)")
 
     disability_ui = map_disability(row.get(cols["disability"]), cfg)
-    if not disability_ui:
-        raise ValueError(f"Invalid or missing disability {norm(row.get(cols['disability']))!r} (no WAI option)")
+    disability_raw = norm(row.get(cols["disability"]))
+    if not disability_raw:
+        add_error("Description_CSE_DI is required")
+    elif not disability_ui:
+        add_error(f"Invalid disability {disability_raw!r} (not in disability_mapping)")
 
-    eth_raw = norm(row.get(cols["ethcd"]))
-    eth_map = {"Y": "Yes", "N": "No", "D": "Declined to State"}
+    eth_input = norm(row.get(cols["ethcd"]))
+    eth_raw = eth_input.upper()
+    allowed_ethcd = [str(x).upper() for x in validation_cfg.get("allowed_ethcd", ["Y", "N"])]
+    eth_map = {"Y": "Yes", "N": "No"}
     ethnicity_ui = eth_map.get(eth_raw)
-    if not ethnicity_ui:
-        raise ValueError(f"Invalid or missing ethnicity code {eth_raw!r} (expected Y/N/D)")
+    if not eth_raw:
+        add_error("EthCd is required")
+    elif eth_raw not in allowed_ethcd:
+        add_error(f"Invalid ethnicity code {eth_input!r} (allowed {allowed_ethcd})")
+    elif eth_input and eth_input != eth_raw and validation_log_fn:
+        _log(validation_log_fn, f"Excel row {excel_row_num}: EthCd {eth_input!r} normalized to {eth_raw!r}.")
 
-    race_ui = map_race(row.get(cols["race1"]), cfg)
+    race_raw = norm(row.get(cols["race1"]))
+    race_ui = ""
+    if not race_raw:
+        add_error("Description_STU_RC1 is required")
+    else:
+        race_ui = map_race(
+            race_raw,
+            cfg,
+            validation_log_fn=validation_log_fn,
+            excel_row_num=excel_row_num,
+        )
 
     aeries_school = norm(row.get(cols["aeries_school"]))
-    wai_school = resolve_school(aeries_school, cfg)
+    wai_school = ""
+    if not aeries_school:
+        add_error("School name is required")
+    else:
+        try:
+            wai_school = resolve_school(
+                aeries_school,
+                cfg,
+                validation_log_fn=validation_log_fn,
+                excel_row_num=excel_row_num,
+            )
+        except (KeyError, ValueError) as e:
+            add_error(str(e))
+
+    if errors:
+        raise ValueError("; ".join(errors))
 
     return Student(
-        first_name=norm(row.get(cols["first_name"])),
-        last_name=norm(row.get(cols["last_name"])),
+        first_name=first_name,
+        last_name=last_name,
         ssid=ssid,
         dob=dob_ui,
         gender_ui=gender_ui,
@@ -460,22 +811,153 @@ def validate_and_prepare(row: Dict[str, Any], cfg: Dict[str, Any]) -> Student:
     )
 
 
+def prepare_input_rows(
+    rows: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    validation_log_fn=None,
+    today: date | None = None,
+) -> Tuple[List[PreparedInputRow], List[InvalidInputRow]]:
+    prepared: List[PreparedInputRow] = []
+    invalid: List[InvalidInputRow] = []
+    cols = cfg["columns"]
+    seen_ssid_rows: Dict[str, int] = {}
+
+    for i, row in enumerate(rows, start=1):
+        excel_row_num = int(row.get(EXCEL_ROW_NUM_KEY) or (i + 1))
+        display_name = row_display_name(row, cfg)
+        ssid_raw = normalized_integral_text(row.get(cols["ssid"]))
+
+        try:
+            student = validate_and_prepare(
+                row,
+                cfg,
+                validation_log_fn=validation_log_fn,
+                today=today,
+            )
+            if student.ssid in seen_ssid_rows:
+                first_row = seen_ssid_rows[student.ssid]
+                invalid.append(
+                    InvalidInputRow(
+                        excel_row_num=excel_row_num,
+                        display_name=f"{student.first_name} {student.last_name}".strip(),
+                        ssid=student.ssid,
+                        action="NEEDS_INPUT_DATA",
+                        details=(
+                            f"Excel row {excel_row_num}: Duplicate State Student ID {student.ssid!r}; "
+                            f"already present on Excel row {first_row}"
+                        ),
+                    )
+                )
+                continue
+            seen_ssid_rows[student.ssid] = excel_row_num
+            prepared.append(
+                PreparedInputRow(
+                    excel_row_num=excel_row_num,
+                    student=student,
+                    display_name=f"{student.first_name} {student.last_name}".strip(),
+                )
+            )
+        except ValueError as e:
+            action = "SKIPPED_MISSING_SSID" if not ssid_raw else "NEEDS_INPUT_DATA"
+            invalid.append(
+                InvalidInputRow(
+                    excel_row_num=excel_row_num,
+                    display_name=display_name,
+                    ssid=ssid_raw,
+                    action=action,
+                    details=f"Excel row {excel_row_num}: Input data incomplete or invalid: {e}",
+                )
+            )
+
+    return prepared, invalid
+
+
 # =========================
 # Excel Reader
 # =========================
 
-def read_excel_rows(excel_path: str) -> List[Dict[str, Any]]:
+def expected_input_headers(cfg: Dict[str, Any]) -> List[str]:
+    cols = cfg["columns"]
+    return [
+        cols["first_name"],
+        cols["last_name"],
+        cols["ssid"],
+        cols["dob"],
+        cols["gender"],
+        cols["grade"],
+        cols["disability"],
+        cols["ethcd"],
+        cols["race1"],
+        cols["aeries_school"],
+    ]
+
+
+def validate_input_headers(headers: List[str], cfg: Dict[str, Any]) -> None:
+    expected = expected_input_headers(cfg)
+    errors = []
+
+    for i, expected_header in enumerate(expected, start=1):
+        actual = headers[i - 1] if i <= len(headers) else ""
+        if actual != expected_header:
+            errors.append(
+                f"column {get_column_letter(i)} expected {expected_header!r}, got {actual!r}"
+            )
+
+    extra_headers = [
+        (i, h)
+        for i, h in enumerate(headers[len(expected):], start=len(expected) + 1)
+        if norm(h)
+    ]
+    for i, extra in extra_headers:
+        errors.append(f"unexpected extra header in column {get_column_letter(i)}: {extra!r}")
+
+    if errors:
+        raise ValueError("INPUT_HEADER_ERROR: " + "; ".join(errors))
+
+
+def read_excel_rows(excel_path: str, cfg: Dict[str, Any] | None = None, log_fn=None) -> List[Dict[str, Any]]:
     wb = load_workbook(excel_path, read_only=True, data_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
+    wb.close()
     if not rows:
         return []
-    headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+
+    headers = []
+    for i, raw_header in enumerate(rows[0], start=1):
+        header_text = "" if raw_header is None else str(raw_header)
+        clean_header, changes = sanitize_excel_text(header_text)
+        log_excel_sanitization(log_fn, 1, i, "header", header_text, clean_header, changes)
+        headers.append(clean_header)
+
+    if cfg is not None:
+        validate_input_headers(headers, cfg)
+
     out: List[Dict[str, Any]] = []
-    for r in rows[1:]:
-        if all(v is None or str(v).strip() == "" for v in r):
+    name_headers = set()
+    if cfg is not None:
+        cols = cfg.get("columns", {}) or {}
+        name_headers = {cols.get("first_name"), cols.get("last_name")}
+
+    for excel_row_num, r in enumerate(rows[1:], start=2):
+        cleaned_row = []
+        for i, raw_value in enumerate(r, start=1):
+            clean_value, changes = sanitize_excel_value(raw_value)
+            header = headers[i - 1] if i <= len(headers) else ""
+            if header in name_headers:
+                name_value, name_changes = sanitize_person_name_value(clean_value)
+                if name_changes:
+                    clean_value = name_value
+                    changes = sorted(set(changes + name_changes))
+            log_excel_sanitization(log_fn, excel_row_num, i, header, raw_value, clean_value, changes)
+            cleaned_row.append(clean_value)
+
+        if all(v is None or str(v).strip() == "" for v in cleaned_row):
             continue
-        out.append({headers[i]: r[i] for i in range(min(len(headers), len(r)))})
+
+        row_dict = {headers[i]: cleaned_row[i] for i in range(min(len(headers), len(cleaned_row)))}
+        row_dict[EXCEL_ROW_NUM_KEY] = excel_row_num
+        out.append(row_dict)
     return out
 
 
@@ -549,6 +1031,15 @@ def goto_student_records(page, cfg=None, log_fn=None, run_id=None):
             print(msg)
 
     _log_local("Navigating to Student Records (hover-only, no parent clicks)...")
+
+    close_transient_overlays(page)
+
+    try:
+        if "/student-data/search-student-records" in (page.url or "") and page.get_by_placeholder("SSID").is_visible():
+            _log_local("Already on Student Records - using current page.")
+            return
+    except Exception:
+        pass
 
     submenu_selector = "a[href='/student-data/search-student-records']"
     submenu = page.locator(submenu_selector)
@@ -643,53 +1134,90 @@ def goto_student_records(page, cfg=None, log_fn=None, run_id=None):
     raise RuntimeError("Failed to reveal/click Student Records via hover-based strategies. Check screenshot.")
 
 
+def close_transient_overlays(page, timeout_ms: int = 1000) -> None:
+    """Close leftover dropdown portals that can intercept the next click."""
+    for _ in range(2):
+        try:
+            listbox = page.get_by_role("listbox")
+            visible = False
+            for i in range(min(listbox.count(), 5)):
+                try:
+                    if listbox.nth(i).is_visible():
+                        visible = True
+                        break
+                except Exception:
+                    pass
+            if not visible:
+                break
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(100)
+        except Exception:
+            break
+
+    try:
+        expect(page.get_by_role("listbox")).to_be_hidden(timeout=timeout_ms)
+    except Exception:
+        pass
+
+
+def wait_for_search_loader_to_settle(page) -> None:
+    loader = page.get_by_test_id("loader")
+    try:
+        loader.wait_for(state="visible", timeout=1500)
+    except Exception:
+        pass
+    try:
+        if loader.count() > 0 and loader.is_visible():
+            try:
+                loader.wait_for(state="hidden", timeout=10_000)
+            except Exception:
+                loader.wait_for(state="detached", timeout=10_000)
+    except Exception:
+        pass
+
+
 def set_search_project_scope(page, cfg: Dict[str, Any]) -> None:
     target = cfg["workability"]["search_project"]
     page.get_by_label("WAI Project").click()
     page.get_by_label(target, exact=True).click()
 
     # Optional but recommended: wait for project-scope refresh to settle
-    loader = page.get_by_test_id("loader")
-    try:
-        loader.wait_for(state="visible", timeout=1500)
-    except Exception:
-        pass
-    try:
-        if loader.count() > 0 and loader.is_visible():
-            try:
-                loader.wait_for(state="hidden", timeout=10_000)
-            except Exception:
-                loader.wait_for(state="detached", timeout=10_000)
-    except Exception:
-        pass
+    wait_for_search_loader_to_settle(page)
+
+
+def set_search_program_year_all(page) -> None:
+    select_combobox_option(page, re.compile(r"Program\s*Year", re.I), "All")
+    wait_for_search_loader_to_settle(page)
+
+
+def click_search_radio(page, label_text: str) -> None:
+    radio = (
+        page.locator("div")
+        .filter(has_text=re.compile(rf"^{re.escape(label_text)}$"))
+        .locator("#radio-group-item")
+        .first
+    )
+    expect(radio).to_be_visible(timeout=8000)
+    radio.click()
+
+
+def set_search_scope_filters(page, cfg: Dict[str, Any]) -> None:
+    set_search_project_scope(page, cfg)
+    set_search_program_year_all(page)
+    click_search_radio(page, "All Students")
+    click_search_radio(page, "Any Baseline or Follow-Up Record")
 
 
 
 def search_by_ssid(page, ssid: str, cfg: Dict[str, Any]) -> None:
-    set_search_project_scope(page, cfg)
+
+    set_search_scope_filters(page, cfg)
 
     page.get_by_placeholder("SSID").fill(ssid)
     page.get_by_role("button", name="Search").click()
 
     # --- Wait for async search to settle (race-condition guard) ---
-    loader = page.get_by_test_id("loader")
-
-    # Give loader a short chance to appear (handles "appears slightly after click")
-    try:
-        loader.wait_for(state="visible", timeout=1500)
-    except Exception:
-        pass
-
-    # If it is visible, wait for it to finish (hidden or removed)
-    try:
-        if loader.count() > 0 and loader.is_visible():
-            try:
-                loader.wait_for(state="hidden", timeout=10_000)
-            except Exception:
-                loader.wait_for(state="detached", timeout=10_000)
-    except Exception:
-        # Don't fail the run over loader weirdness; outcome logic will still guard too.
-        pass
+    wait_for_search_loader_to_settle(page)
 
 
 
@@ -733,12 +1261,23 @@ def determine_search_outcome(page, timeout_ms: int = 3000) -> str:
 
         page.wait_for_timeout(step_ms)
 
-    raise RuntimeError("Search outcome unclear: neither Edit nor zero-results message appeared within timeout.")
+    raise RuntimeError(
+        "Search outcome unclear: neither Edit nor zero-results message appeared within timeout, "
+        "or two Edit buttons appeared - one for Baseline and one for Follow-Up and this flow isn't currently supported."
+    )
 
 
 def open_existing_student_edit(page) -> None:
     page.get_by_role("button", name="Edit").first.click()
     expect(page.locator("body")).to_be_visible()
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception:
+        pass
+    page.get_by_text(re.compile(r"Student\s+Basics|Baseline\s+and\s+Follow", re.I)).first.wait_for(
+        state="visible",
+        timeout=10000,
+    )
 
 
 def request_transfer_if_possible(page) -> str:
@@ -753,7 +1292,140 @@ def request_transfer_if_possible(page) -> str:
     return "TRANSFER_PENDING"
 
 
-def select_combobox_option(page, label_regex, option_text: str, timeout_ms: int = 8000):
+def get_prior_year_transfer_control(page, timeout_ms: int = 8000):
+    deadline = time.monotonic() + (timeout_ms / 1000)
+
+    while True:
+        candidates = [
+            page.get_by_role("button", name=re.compile(r"^Transfer$", re.I)).first,
+            page.get_by_role("link", name=re.compile(r"^Transfer$", re.I)).first,
+            page.get_by_text("Transfer", exact=True).first,
+        ]
+
+        for candidate in candidates:
+            try:
+                if candidate.count() > 0 and candidate.is_visible():
+                    return candidate
+            except Exception:
+                pass
+
+        if time.monotonic() >= deadline:
+            return None
+
+        page.wait_for_timeout(250)
+
+
+def strip_school_parenthetical(school_name: str) -> str:
+    return norm(re.sub(r"\s*\([^)]*\)\s*$", "", norm(school_name)))
+
+
+def prior_year_school_candidates(wai_school: str) -> List[str]:
+    candidates = []
+    trimmed = strip_school_parenthetical(wai_school)
+    for candidate in [trimmed, norm(wai_school)]:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def select_combobox_option_from_candidates(
+    page,
+    label_regex,
+    option_candidates: List[str],
+    field_name: str,
+    timeout_ms: int = 8000,
+    close_with_escape: bool = True,
+) -> str:
+    errors = []
+    for option_text in option_candidates:
+        try:
+            select_combobox_option(
+                page,
+                label_regex,
+                option_text,
+                timeout_ms=timeout_ms,
+                close_with_escape=close_with_escape,
+            )
+            return option_text
+        except Exception as e:
+            errors.append(f"{option_text!r}: {e}")
+
+    raise RuntimeError(
+        f"Could not select {field_name}. Tried: {option_candidates}. "
+        f"Errors: {' | '.join(errors)}"
+    )
+
+
+def transfer_prior_year_student(
+    page,
+    cfg: Dict[str, Any],
+    wai_school: str,
+    save: bool = True,
+    log_fn=None,
+    run_id=None,
+) -> Dict[str, str]:
+    transfer_control = get_prior_year_transfer_control(page)
+    if transfer_control is None:
+        return {}
+
+    transfer_to_project = norm(cfg.get("workability", {}).get("transfer_to_project"))
+    if not transfer_to_project:
+        raise KeyError("config.yaml workability.transfer_to_project is required for prior-year transfers.")
+
+    def _l(msg: str):
+        if log_fn and run_id:
+            _log(log_fn, f"[{run_id}] {msg}")
+        elif log_fn:
+            _log(log_fn, msg)
+
+    _l("Prior-year Transfer link found. Opening transfer modal...")
+    transfer_control.click()
+
+    expect(page.get_by_text(re.compile(r"^Transfer Student$", re.I))).to_be_visible(timeout=10000)
+
+    _l(f"Selecting prior-year transfer project: {transfer_to_project}")
+    select_combobox_option(
+        page,
+        re.compile(r"Transfer\s+to", re.I),
+        transfer_to_project,
+        timeout_ms=10000,
+        close_with_escape=False,
+    )
+
+    school_candidates = prior_year_school_candidates(wai_school)
+    _l(f"Selecting prior-year transfer school from candidates: {school_candidates}")
+    selected_school = select_combobox_option_from_candidates(
+        page,
+        re.compile(r"School\s+of\s+Attendance", re.I),
+        school_candidates,
+        "prior-year transfer School of Attendance",
+        timeout_ms=10000,
+        close_with_escape=False,
+    )
+
+    if save:
+        _l("Saving prior-year transfer...")
+        click_save_robust(page, timeout_ms=15000, log_fn=log_fn, run_id=run_id)
+        try:
+            expect(page.get_by_text(re.compile(r"^Transfer Student$", re.I))).to_be_hidden(timeout=10000)
+        except Exception:
+            pass
+    else:
+        _l("Prior-year transfer modal filled. Save was intentionally skipped.")
+
+    return {
+        "transfer_to_project": transfer_to_project,
+        "school": selected_school,
+    }
+
+
+def select_combobox_option(
+    page,
+    label_regex,
+    option_text: str,
+    timeout_ms: int = 8000,
+    close_with_escape: bool = True,
+):
     """
     Select an option from a Radix/shadcn combobox (robust + deterministic).
     - Verifies the option exists in the UI list before clicking (typo-proof).
@@ -770,10 +1442,12 @@ def select_combobox_option(page, label_regex, option_text: str, timeout_ms: int 
     combo = page.get_by_label(label_regex)
     expect(combo).to_be_visible(timeout=timeout_ms)
     expect(combo).to_be_enabled(timeout=timeout_ms)
+    scroll_timeout_ms = min(timeout_ms, 3000)
 
-    # Always clear any lingering portal first
-    page.keyboard.press("Escape")
-    page.wait_for_timeout(100)
+    # Always clear any lingering portal first. Skip this inside modals because
+    # Escape can close the dialog when no dropdown is open.
+    if close_with_escape:
+        close_transient_overlays(page)
 
     # Open dropdown (retry in case a prior overlay blocks click)
     last_err = None
@@ -784,9 +1458,12 @@ def select_combobox_option(page, label_regex, option_text: str, timeout_ms: int 
             break
         except Exception as e:
             last_err = e
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(150)
+            if close_with_escape:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(150)
     else:
+        if close_with_escape:
+            close_transient_overlays(page)
         raise RuntimeError(f"Failed to open combobox after retries: {last_err}")
 
     # Pull option texts from the UI (source of truth)
@@ -801,7 +1478,8 @@ def select_combobox_option(page, label_regex, option_text: str, timeout_ms: int 
 
     # Deterministic mismatch guardrail
     if available and target_norm not in available_norm:
-        page.keyboard.press("Escape")
+        if close_with_escape:
+            close_transient_overlays(page)
 
         suggestion = suggest_closest_match(option_text, available)
 
@@ -826,7 +1504,7 @@ def select_combobox_option(page, label_regex, option_text: str, timeout_ms: int 
             option = listbox.get_by_role("option", name=option_re).first
 
             expect(option).to_be_visible(timeout=timeout_ms)
-            option.scroll_into_view_if_needed(timeout=300)
+            option.scroll_into_view_if_needed(timeout=scroll_timeout_ms)
 
             # Normal click first
             option.click(timeout=3000)
@@ -836,29 +1514,34 @@ def select_combobox_option(page, label_regex, option_text: str, timeout_ms: int 
             last_err = e
 
             # Close & reopen to reset portal state
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(150)
+            if close_with_escape:
+                close_transient_overlays(page)
 
-            try:
-                combo.click(timeout=3000)
-                listbox = get_active_listbox()
-            except Exception:
-                pass
+                try:
+                    combo.click(timeout=3000)
+                    listbox = get_active_listbox()
+                except Exception:
+                    pass
 
             # Last attempt: sometimes Radix options get finicky; allow force click
             if attempt == 3:
                 try:
                     option = page.get_by_role("option", name=option_re).first
-                    option.scroll_into_view_if_needed(timeout=300)
+                    option.scroll_into_view_if_needed(timeout=scroll_timeout_ms)
                     option.click(timeout=3000, force=True)
                     break
                 except Exception as e2:
                     last_err = e2
     else:
+        if close_with_escape:
+            close_transient_overlays(page)
         raise RuntimeError(f"Failed to click combobox option '{option_text}' after retries: {last_err}")
 
-    # Ensure portal closes so it doesn't eat next click (Save)
-    page.keyboard.press("Escape")
+    # Ensure portal closes so it doesn't eat next click (Save). Skip the extra
+    # Escape inside modals because the selected option normally closes the
+    # listbox, and Escape could close the dialog.
+    if close_with_escape:
+        close_transient_overlays(page)
     try:
         expect(page.get_by_role("listbox")).to_be_hidden(timeout=2000)
     except Exception:
@@ -961,63 +1644,24 @@ def create_new_student(
         _log(log_fn, f"[{run_id}] Selecting gender: {student.gender_ui}")
     select_gender(page, student.gender_ui)
 
-    create_project = cfg["workability"]["create_project"]
-    page.get_by_label(re.compile(r"WAI Project", re.I)).click()
-    page.get_by_label(create_project, exact=True).click()
+    # WAI Project is now pre-filled / read-only on new student form — skip it.
+    # (codegen shows it just Tabs past it)
+    if log_fn and run_id:
+        _log(log_fn, f"[{run_id}] WAI Project pre-filled (skipping dropdown).")
 
-    loader = page.get_by_test_id("loader")
-    try:
-        loader.wait_for(state="visible", timeout=1500)
-    except Exception:
-        pass
-    try:
-        if loader.count() > 0 and loader.is_visible():
-            try:
-                loader.wait_for(state="hidden", timeout=10_000)
-            except Exception:
-                loader.wait_for(state="detached", timeout=10_000)
-    except Exception:
-        pass
-
-
-
+    # School of Attendance is now a Radix combobox (NOT a native <select>)
     if log_fn and run_id:
         _log(log_fn, f"[{run_id}] Selecting school: {student.wai_school}")
 
-    label = page.get_by_text(re.compile(r"^School of Attendance", re.I)).first
+    school_label_regex = re.compile(r"School of Attendance", re.I)
+    
+    # Wait for the school combobox to be ready
+    school_combo = page.get_by_label(school_label_regex)
+    expect(school_combo).to_be_visible(timeout=15000)
+    expect(school_combo).to_be_enabled(timeout=15000)
 
-    control_id = None
-    try:
-        control_id = label.evaluate("el => el.getAttribute && el.getAttribute('for')")
-    except Exception:
-        control_id = None
-
-    if control_id:
-        school_select = page.locator(f"select#{control_id}")
-    else:
-        school_select = label.locator("xpath=following::select[1]")
-
-    expect(school_select).to_be_visible(timeout=15000)
-    expect(school_select).to_be_enabled(timeout=15000)
-
-    for _ in range(30):
-        if school_select.locator("option").count() > 1:
-            break
-        page.wait_for_timeout(500)
-    else:
-        raise RuntimeError("School dropdown options never populated (still <=1 option after 15s).")
-
-    opt = school_select.locator("option").filter(has_text=re.compile(re.escape(student.wai_school), re.I)).first
-    value = opt.get_attribute("value")
-    if not value:
-        first_few = school_select.locator("option").all_inner_texts()[:10]
-        raise RuntimeError(f"Could not find <option value> for school '{student.wai_school}'. First options: {first_few}")
-
-    school_select.select_option(value=value)
-
-    selected_text = school_select.locator("option:checked").inner_text()
-    if log_fn and run_id:
-        _log(log_fn, f"[{run_id}] School selected (UI): {selected_text}")
+    # Use the existing robust combobox selector
+    select_combobox_option(page, school_label_regex, student.wai_school)
 
     if log_fn and run_id:
         _log(log_fn, f"[{run_id}] Selecting record type: Baseline 2025-26")
@@ -1033,10 +1677,9 @@ def create_new_student(
 
     expect(page.get_by_label(re.compile(r"Grade", re.I))).to_be_visible(timeout=10000)
 
-    # One-time preflight hook (run-level state lives in run(), but executes here where Race exists)
     if on_form_expanded:
         on_form_expanded(page)
-        
+
     if log_fn and run_id:
         _log(log_fn, f"[{run_id}] Selecting grade: {student.grade_ui}")
     select_combobox_option(page, re.compile(r"Grade", re.I), str(student.grade_ui))
@@ -1063,6 +1706,285 @@ def create_new_student(
         run_id=run_id,
         toast_regex=re.compile(r"successfully\s+saved", re.I),
     )
+
+
+ARRAY_SERVICE_TARGETS = [
+    (
+        "Career / Vocational Assessments",
+        re.compile(r"^Career\s*/\s*Vocational\s+Assessments$", re.I),
+    ),
+    (
+        "Employment / Post-Secondary Education Planning",
+        re.compile(r"^Employment\s*/\s*Post[-\s]*Secondary\s+Education\s+Planning$", re.I),
+    ),
+    (
+        "Career Awareness / Exploration Activities",
+        re.compile(r"^Career\s+Awareness\s*/\s*Exploration\s+Activities$", re.I),
+    ),
+    (
+        "Career Preparation / Job Search",
+        re.compile(r"^Career\s+Preparation\s*/\s*Job\s+Search$", re.I),
+    ),
+    (
+        "Self-Advocacy / Disability Awareness",
+        re.compile(r"^Self[-\s]*Advocacy\s*/\s*Disability\s+Awareness$", re.I),
+    ),
+    (
+        "Youth Leadership",
+        re.compile(r"^Youth\s+Leadership$", re.I),
+    ),
+]
+
+SERVE_LAYOUT_CHANGED_PREFIX = "SERVE_LAYOUT_CHANGED"
+
+
+def open_array_of_services(page) -> None:
+    candidates = [
+        page.get_by_role("link", name=re.compile(r"Array\s+of\s+Services", re.I)).first,
+        page.get_by_role("tab", name=re.compile(r"Array\s+of\s+Services", re.I)).first,
+        page.get_by_text(re.compile(r"^Array\s+of\s+Services$", re.I)).first,
+    ]
+
+    last_err = None
+    for candidate in candidates:
+        try:
+            if candidate.count() > 0 and candidate.is_visible():
+                candidate.click(timeout=5000)
+                break
+        except Exception as e:
+            last_err = e
+    else:
+        raise RuntimeError(f"Could not find/click Array of Services tab: {last_err}")
+
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception:
+        pass
+
+    expect(page.get_by_text(ARRAY_SERVICE_TARGETS[0][1]).first).to_be_visible(timeout=15000)
+    expect(page.get_by_text(ARRAY_SERVICE_TARGETS[1][1]).first).to_be_visible(timeout=15000)
+
+
+def serve_layout_changed(message: str) -> RuntimeError:
+    return RuntimeError(
+        f"{SERVE_LAYOUT_CHANGED_PREFIX}: {message} "
+        "The WAI Array of Services page structure appears to have changed and the code needs to be updated."
+    )
+
+
+def _fill_array_service_row_by_geometry(page, row_label: str, hours: str) -> Dict[str, Any]:
+    result = page.evaluate(
+        """
+        ({rowLabel, hours}) => {
+            const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const display = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
+            const needle = norm(rowLabel);
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+            };
+            const textOf = (el) => norm(el.innerText || el.textContent || '');
+            const displayTextOf = (el) => display(el.innerText || el.textContent || '');
+            const area = (el) => {
+                const rect = el.getBoundingClientRect();
+                return rect.width * rect.height;
+            };
+            const exact = Array.from(document.querySelectorAll('body *'))
+                .filter(el => visible(el) && textOf(el) === needle)
+                .sort((a, b) => {
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+                    return area(a) - area(b) || ar.left - br.left;
+                });
+            const label = exact[0];
+
+            if (!label) {
+                return {
+                    ok: false,
+                    reason: `Could not find exact Array of Services row label "${rowLabel}".`,
+                };
+            }
+
+            const labelRect = label.getBoundingClientRect();
+            const labelCenterY = labelRect.top + (labelRect.height / 2);
+
+            const headerCandidates = Array.from(document.querySelectorAll('body *'))
+                .filter(el => visible(el) && textOf(el) === 'wai')
+                .map(el => {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        el,
+                        rect,
+                        centerX: rect.left + (rect.width / 2),
+                        centerY: rect.top + (rect.height / 2),
+                        text: displayTextOf(el),
+                    };
+                })
+                .filter(item => item.centerY < labelCenterY)
+                .sort((a, b) => {
+                    const aDist = labelCenterY - a.centerY;
+                    const bDist = labelCenterY - b.centerY;
+                    return aDist - bDist || area(a.el) - area(b.el);
+                });
+
+            const header = headerCandidates[0];
+            if (!header) {
+                return {
+                    ok: false,
+                    reason: `Could not find exact "WAI" column header above Array of Services row "${rowLabel}".`,
+                };
+            }
+
+            const inputs = Array.from(document.querySelectorAll('input'))
+                .filter(input => {
+                    if (!visible(input)) return false;
+                    if (String(input.type || '').toLowerCase() === 'checkbox') return false;
+                    const rect = input.getBoundingClientRect();
+                    const centerY = rect.top + (rect.height / 2);
+                    return Math.abs(centerY - labelCenterY) <= 70;
+                })
+                .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+
+            if (!inputs.length) {
+                return {
+                    ok: false,
+                    reason: `Could not find hour inputs aligned with Array of Services row "${rowLabel}".`,
+                };
+            }
+
+            const scored = inputs
+                .map((input, index) => {
+                    const rect = input.getBoundingClientRect();
+                    const centerX = rect.left + (rect.width / 2);
+                    return {
+                        input,
+                        index,
+                        rect,
+                        distance: Math.abs(centerX - header.centerX),
+                    };
+                })
+                .sort((a, b) => a.distance - b.distance);
+
+            const selected = scored[0];
+            const field = selected && selected.input;
+            if (!field) {
+                return {
+                    ok: false,
+                    reason: `Could not locate WAI hours input for Array of Services row "${rowLabel}".`,
+                };
+            }
+
+            if (selected.distance > 90) {
+                return {
+                    ok: false,
+                    reason: `Closest input for row "${rowLabel}" is too far from the WAI column header (${Math.round(selected.distance)} px).`,
+                };
+            }
+
+            field.scrollIntoView({ block: 'center', inline: 'center' });
+            const setValue = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            const originalValue = display(field.value);
+            const numericOriginal = Number(originalValue);
+            const shouldFill = originalValue !== '' && Number.isFinite(numericOriginal) && numericOriginal === 0;
+
+            if (shouldFill) {
+                field.focus();
+                setValue.call(field, '');
+                field.dispatchEvent(new Event('input', { bubbles: true }));
+                setValue.call(field, hours);
+                field.dispatchEvent(new Event('input', { bubbles: true }));
+                field.dispatchEvent(new Event('change', { bubbles: true }));
+                field.blur();
+            }
+
+            const fieldRect = field.getBoundingClientRect();
+            return {
+                ok: true,
+                value: field.value,
+                originalValue,
+                action: shouldFill ? 'filled' : 'left_existing',
+                inputCount: inputs.length,
+                selectedIndex: selected.index,
+                rowLabel,
+                labelText: displayTextOf(label),
+                columnHeader: header.text,
+                columnHeaderLeft: Math.round(header.rect.left),
+                columnHeaderTop: Math.round(header.rect.top),
+                distanceFromColumnHeader: Math.round(selected.distance),
+                fieldLeft: Math.round(fieldRect.left),
+                fieldTop: Math.round(fieldRect.top),
+            };
+        }
+        """,
+        {"rowLabel": row_label, "hours": hours},
+    )
+
+    if not result or not result.get("ok"):
+        raise serve_layout_changed((result or {}).get("reason") or f"Could not resolve row {row_label!r}.")
+
+    return result
+
+
+def fill_array_service_wai_hours(page, row_label: str, label_regex: re.Pattern, hours: str = "0.5") -> Dict[str, Any]:
+    expect(page.get_by_text(label_regex).first).to_be_visible(timeout=8000)
+    result = _fill_array_service_row_by_geometry(page, row_label, hours)
+    value = norm((result or {}).get("value"))
+    action = (result or {}).get("action")
+    if action == "filled" and value != hours:
+        raise RuntimeError(
+            f"Array of Services WAI hours for {row_label!r} expected {hours!r} after fill, got {value!r}; "
+            f"locator result={result!r}"
+        )
+    if not value:
+        raise RuntimeError(
+            f"Array of Services WAI hours for {row_label!r} is blank after evaluation; locator result={result!r}"
+        )
+    page.wait_for_timeout(150)
+    return result
+
+
+def fill_array_of_services_dry_run(page, hours: str = "0.5", log_fn=None, run_id=None) -> List[Dict[str, Any]]:
+    def _l(msg: str) -> None:
+        if log_fn and run_id:
+            _log(log_fn, f"[{run_id}] {msg}")
+        elif log_fn:
+            _log(log_fn, msg)
+
+    open_array_of_services(page)
+    results: List[Dict[str, Any]] = []
+    for row_label, label_regex in ARRAY_SERVICE_TARGETS:
+        _l(f"Setting Array of Services WAI hours: {row_label} = {hours}")
+        result = fill_array_service_wai_hours(page, row_label, label_regex, hours=hours)
+        results.append(result)
+        if result.get("action") == "filled":
+            _l(
+                f"Array of Services filled: {row_label}; "
+                f"{result.get('originalValue')!r} -> {result.get('value')!r}; "
+                f"column={result.get('columnHeader')!r}; distance={result.get('distanceFromColumnHeader')}px"
+            )
+        else:
+            _l(
+                f"Array of Services left unchanged: {row_label}; "
+                f"existing value={result.get('value')!r}; "
+                f"column={result.get('columnHeader')!r}; distance={result.get('distanceFromColumnHeader')}px"
+            )
+
+    missing = [label for label, _ in ARRAY_SERVICE_TARGETS if label not in {r.get("rowLabel") for r in results}]
+    if missing:
+        raise RuntimeError(f"Array of Services verification missing rows: {missing}")
+
+    _l("Array of Services verification before save:")
+    for result in results:
+        _l(
+            f"  {result.get('rowLabel')}: WAI={result.get('value')!r} "
+            f"({result.get('action')}, was {result.get('originalValue')!r})"
+        )
+
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(500)
+    return results
 
 
 # =========================
@@ -1137,12 +2059,10 @@ def run(
     _log(log_fn, f"[{run_id}] Starting run. Excel: {excel_path}")
     _user("🚀 Starting Workabili-Bot3000 run…", 0.5)
 
-    rows = read_excel_rows(excel_path)
-    if not rows:
-        _user("⚠️ No rows found in Excel.", 0.5)
-        return
+    sanitization_log_path = os.path.join("output", "logs", "input_sanitization.log")
+    _sanitization_log = make_input_audit_logger(sanitization_log_path, run_id, log_fn=log_fn)
 
-    total = len(rows)
+    rows = read_excel_rows(excel_path, cfg=cfg, log_fn=_sanitization_log)
 
     # -------------------------
     # Run summary stats (for UI)
@@ -1152,6 +2072,7 @@ def run(
         "created": 0,
         "transfer_requested": 0,
         "transfer_pending": 0,
+        "transferred_prior_year": 0,
         "already_owned": 0,
         "skipped": 0,
         "errors": 0,
@@ -1162,6 +2083,50 @@ def run(
         stats[key] = int(stats.get(key, 0)) + n
 
 
+
+    if not rows:
+        _user("⚠️ No rows found in Excel.", 0.5)
+        return {
+            "run_id": run_id,
+            "ledger_path": ledger_path,
+            **stats,
+        }
+
+    prepared_rows, invalid_rows = prepare_input_rows(
+        rows,
+        cfg,
+        validation_log_fn=_sanitization_log,
+    )
+
+    for invalid in invalid_rows:
+        _log(
+            log_fn,
+            f"[{run_id}] {invalid.action}: row {invalid.excel_row_num} "
+            f"{invalid.ssid or '(no SSID)'} ({invalid.display_name}) -> {invalid.details}",
+        )
+        _inc("skipped")
+        _user(f"{invalid.action}||display_name={invalid.display_name}", ui_hold_default)
+        append_ledger_xlsx(ledger_path, {
+            "run_id": run_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "ssid": invalid.ssid,
+            "student_name": invalid.display_name,
+            "action": invalid.action,
+            "details": invalid.details,
+            "screenshot": "",
+            "trace": "",
+        })
+
+    if not prepared_rows:
+        _user("⚠️ No valid rows found in Excel.", 0.5)
+        _log(log_fn, f"[{run_id}] No valid rows found after validation. Ledger: {ledger_path}")
+        return {
+            "run_id": run_id,
+            "ledger_path": ledger_path,
+            **stats,
+        }
+
+    total = len(prepared_rows)
 
     resume = bool(cfg.get("run", {}).get("resume", True))
     completed: Set[str] = set()
@@ -1212,45 +2177,16 @@ def run(
         _user("📚 Logged in. Opening Student Records…", 0.5)
         goto_student_records(page, cfg=cfg, log_fn=log_fn, run_id=run_id)
 
-        for i, row in enumerate(rows):
+        for i, prepared in enumerate(prepared_rows):
             if _should_stop():
                 _user("🛑 Stopped by user.", 0.5)
                 _inc("stopped")
                 break
 
-            fn = norm(row.get(cfg["columns"]["first_name"]))
-            ln = norm(row.get(cfg["columns"]["last_name"]))
-            display_name = f"{fn} {ln}".strip()
+            student = prepared.student
+            display_name = prepared.display_name
 
             _user(f"🔎 {i+1} of {total}: Checking {display_name}…", 0.5)
-
-            try:
-                student = validate_and_prepare(row, cfg)
-            except ValueError as ve:
-                ssid_raw = norm(row.get(cfg["columns"]["ssid"]))
-
-                if "Missing SSID" in str(ve):
-                    action = "SKIPPED_MISSING_SSID"
-                    details = "Missing SSID in input file (cannot proceed)"
-                    _user(f"SKIPPED_MISSING_SSID||display_name={display_name}", ui_hold_default)
-                else:
-                    action = "NEEDS_INPUT_DATA"
-                    details = f"Input data incomplete or invalid: {ve}"
-                    _user(f"NEEDS_INPUT_DATA||display_name={display_name}", ui_hold_default)
-
-                _log(log_fn, f"[{run_id}] {action}: {ssid_raw or '(no SSID)'} ({display_name}) -> {ve}")
-                _inc("skipped")
-                append_ledger_xlsx(ledger_path, {
-                    "run_id": run_id,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "ssid": ssid_raw,
-                    "student_name": display_name,
-                    "action": action,
-                    "details": details,   # ✅ fixed
-                    "screenshot": "",
-                    "trace": "",
-                })
-                continue
 
             if resume and student.ssid in completed:
                 last_action = last_action_by_ssid.get(student.ssid, "UNKNOWN")
@@ -1267,25 +2203,6 @@ def run(
                     "screenshot": "",
                     "trace": "",
                 })
-                continue
-
-            # If transfer was already requested in a prior run, treat as pending and do NOT re-click UI
-            # (You indicated transfers are effectively terminal/completed in your current workflow.)
-            if student.ssid in transfer_requested_ssids:
-                _log(log_fn, f"[{run_id}] TRANSFER_PENDING: {student.ssid} ({display_name}) (transfer already requested per ledger)")
-                _user(f"TRANSFER_PENDING||display_name={display_name}", ui_hold_default)
-                _inc("transfer_pending")
-                append_ledger_xlsx(ledger_path, {
-                    "run_id": run_id,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "ssid": student.ssid,
-                    "student_name": display_name,
-                    "action": "TRANSFER_PENDING",
-                    "details": "Transfer already requested in a prior run (ledger source of truth). Skipping repeat request.",
-                    "screenshot": "",
-                    "trace": "",
-                })
-                # (Not adding to completed here; your “completed transfer” behavior is already satisfied by this shortcut.)
                 continue
 
             trace_path = ""
@@ -1313,6 +2230,41 @@ def run(
 
                     owning_org = get_found_row_owning_org(page, student.ssid)
                     _log(log_fn, f"[{run_id}] Owning org for {student.ssid}: {owning_org!r}")
+
+                    _log(log_fn, f"[{run_id}] Opening found student record to check for prior-year transfer path...")
+                    open_existing_student_edit(page)
+
+                    prior_year_transfer = transfer_prior_year_student(
+                        page,
+                        cfg,
+                        student.wai_school,
+                        save=True,
+                        log_fn=log_fn,
+                        run_id=run_id,
+                    )
+                    if prior_year_transfer:
+                        details = (
+                            "Transferred prior-year record. "
+                            f"Transfer to={prior_year_transfer['transfer_to_project']}; "
+                            f"School={prior_year_transfer['school']}"
+                        )
+                        _log(log_fn, f"[{run_id}] TRANSFERRED_PRIOR_YEAR: {student.ssid} ({display_name}) -> {details}")
+                        _user(f"TRANSFERRED_PRIOR_YEAR||display_name={display_name}", ui_hold_default)
+                        _inc("transferred_prior_year")
+                        append_ledger_xlsx(ledger_path, {
+                            "run_id": run_id,
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "ssid": student.ssid,
+                            "student_name": display_name,
+                            "action": "TRANSFERRED_PRIOR_YEAR",
+                            "details": details,
+                            "screenshot": "",
+                            "trace": "",
+                        })
+                        completed.add(student.ssid)
+                        if trace_on_failure:
+                            context.tracing.stop()
+                        continue
 
                     if is_already_owned_by_us(owning_org, cfg):
                         _log(log_fn, f"[{run_id}] ALREADY_OWNED: {student.ssid} ({display_name}) -> owned by us, skipping.")
@@ -1342,7 +2294,6 @@ def run(
                     _log(log_fn, f"[{run_id}] FOUND (Edit visible, not SBCSS Student). Checking for envelope/transfer status...")
                     _user("📨 Student exists in another org. Checking transfer…", 0.5)
 
-                    open_existing_student_edit(page)
                     action = request_transfer_if_possible(page)
 
                     details = ""
@@ -1352,7 +2303,6 @@ def run(
                         details = "Requested transfer via envelope (Yes)."
                         _user(f"TRANSFER_REQUESTED||display_name={display_name}", ui_hold_default)
                         _inc("transfer_requested")
-                        transfer_requested_ssids.add(student.ssid)  # so future runs shortcut
                     else:  # TRANSFER_PENDING
                         details = "Transfer pending (previously requested); waiting for release."
                         _user(f"TRANSFER_PENDING||display_name={display_name}", ui_hold_default)
@@ -1423,6 +2373,11 @@ def run(
                 except Exception:
                     screenshot_path = ""
 
+                try:
+                    close_transient_overlays(page)
+                except Exception:
+                    pass
+
                 _log(log_fn, f"[{run_id}] ERROR: {student.ssid} ({display_name}) -> {exc}")
                 _user(f"ERROR||display_name={display_name}", ui_hold_default)
                 _inc("errors")
@@ -1454,6 +2409,343 @@ def run(
             "ledger_path": ledger_path,
             **stats,
         }
+
+
+def run_serve(
+    excel_path: str,
+    config_path: str = "config/config.yaml",
+    username: str | None = None,
+    password: str | None = None,
+    log_fn=None,
+    override_headless: bool | None = None,
+    override_slow_mo_ms: int | None = None,
+    stop_event=None,
+    user_log_fn=None,
+    pause_after_first_fill: bool = False,
+    pause_fn=None,
+    save_after_fill: bool = False,
+    hours: str = "0.5",
+) -> Dict[str, Any]:
+    cfg = load_config(config_path)
+
+    ui_hold_default = float(cfg.get("ui", {}).get("min_status_seconds", 1.5))
+
+    def _user(msg: str, min_hold_sec: float = 0.0):
+        if user_log_fn:
+            user_log_fn(msg)
+        else:
+            _log(log_fn, msg)
+        hold = float(min_hold_sec or 0.0)
+        if hold > 0:
+            time.sleep(hold)
+
+    def _should_stop() -> bool:
+        return bool(stop_event and stop_event.is_set())
+
+    if "search_project" not in cfg["workability"]:
+        raise KeyError("config.yaml workability must include search_project.")
+
+    ledger_path = cfg["ledger"]["path"]
+    ensure_dir("output/screenshots")
+    ensure_dir("output/traces")
+    ensure_dir(os.path.dirname(ledger_path))
+
+    run_id = str(uuid.uuid4())[:8]
+
+    username_default = cfg.get("credentials", {}).get("username", "")
+    if username is None or not str(username).strip():
+        username = username_default or input("WAI Username (email): ").strip()
+
+    if password is None:
+        password = getpass("WAI Password: ")
+
+    if save_after_fill:
+        serve_mode_label = "Marking serves"
+        serve_start_message = "Starting Workabili-Bot3000: Marking serves..."
+        serve_complete_message = "Marking serves completed.  Check the ledger for details."
+        serve_console_complete = f"Marking serves completed. Ledger: {ledger_path}"
+    else:
+        serve_mode_label = "Serve dry-run"
+        serve_start_message = "Starting Workabili-Bot3000 Serve dry-run..."
+        serve_complete_message = "Serve dry-run complete. Check the ledger for details."
+        serve_console_complete = f"Serve dry-run complete. Ledger: {ledger_path}"
+    _log(log_fn, f"[{run_id}] Starting {serve_mode_label}. Excel: {excel_path}")
+    _user(serve_start_message, 0.5)
+
+    sanitization_log_path = os.path.join("output", "logs", "input_sanitization.log")
+    _sanitization_log = make_input_audit_logger(sanitization_log_path, run_id, log_fn=log_fn)
+
+    rows = read_excel_rows(excel_path, cfg=cfg, log_fn=_sanitization_log)
+
+    stats = {
+        "input_rows": len(rows),
+        "serve_dry_run_filled": 0,
+        "serve_saved": 0,
+        "serve_skipped_not_owned": 0,
+        "serve_not_found": 0,
+        "created": 0,
+        "transfer_requested": 0,
+        "transfer_pending": 0,
+        "transferred_prior_year": 0,
+        "already_owned": 0,
+        "skipped": 0,
+        "errors": 0,
+        "stopped": 0,
+    }
+
+    def _inc(key: str, n: int = 1):
+        stats[key] = int(stats.get(key, 0)) + n
+
+    if not rows:
+        _user("No rows found in Excel.", 0.5)
+        return {"run_id": run_id, "ledger_path": ledger_path, **stats}
+
+    prepared_rows, invalid_rows = prepare_input_rows(
+        rows,
+        cfg,
+        validation_log_fn=_sanitization_log,
+    )
+
+    for invalid in invalid_rows:
+        _log(
+            log_fn,
+            f"[{run_id}] {invalid.action}: row {invalid.excel_row_num} "
+            f"{invalid.ssid or '(no SSID)'} ({invalid.display_name}) -> {invalid.details}",
+        )
+        _inc("skipped")
+        _user(f"{invalid.action}||display_name={invalid.display_name}", ui_hold_default)
+        append_ledger_xlsx(ledger_path, {
+            "run_id": run_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "ssid": invalid.ssid,
+            "student_name": invalid.display_name,
+            "action": invalid.action,
+            "details": invalid.details,
+            "screenshot": "",
+            "trace": "",
+        })
+
+    if not prepared_rows:
+        _user("No valid rows found in Excel.", 0.5)
+        _log(log_fn, f"[{run_id}] No valid rows found after validation. Ledger: {ledger_path}")
+        return {"run_id": run_id, "ledger_path": ledger_path, **stats}
+
+    total = len(prepared_rows)
+
+    headless = bool(cfg.get("run", {}).get("headless", False))
+    if override_headless is not None:
+        headless = bool(override_headless)
+
+    slow_mo_ms = int(cfg.get("run", {}).get("slow_mo_ms", 0))
+    if override_slow_mo_ms is not None:
+        slow_mo_ms = int(override_slow_mo_ms)
+    trace_on_failure = bool(cfg.get("trace", {}).get("on_failure", True))
+    stop_on_error = bool(cfg.get("run", {}).get("stop_on_error", False))
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, slow_mo=slow_mo_ms if slow_mo_ms > 0 else None)
+        context = browser.new_context(viewport={"width": 1600, "height": 1400})
+        page = context.new_page()
+
+        try:
+            login(page, username, password, cfg, log_fn=log_fn)
+        except Exception as e:
+            _log(log_fn, f"[{run_id}] FATAL LOGIN ERROR -> {e}")
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+            raise
+
+        if _should_stop():
+            _user("Stopped by user.", 0.5)
+            context.close()
+            browser.close()
+            return {"run_id": run_id, "ledger_path": ledger_path, **stats}
+
+        _log(log_fn, f"[{run_id}] Logged in. Opening Student Records for {serve_mode_label}...")
+        _user("Logged in. Opening Student Records...", 0.5)
+        goto_student_records(page, cfg=cfg, log_fn=log_fn, run_id=run_id)
+
+        for i, prepared in enumerate(prepared_rows):
+            if _should_stop():
+                _user("Stopped by user.", 0.5)
+                _inc("stopped")
+                break
+
+            student = prepared.student
+            display_name = prepared.display_name
+            trace_path = ""
+            screenshot_path = ""
+
+            _user(f"🔎 {i+1} of {total}: Checking {display_name}...", 0.5)
+
+            try:
+                if trace_on_failure:
+                    context.tracing.start(screenshots=True, snapshots=True, sources=True)
+
+                _log(log_fn, f"[{run_id}] SERVE processing SSID {student.ssid} ({display_name})")
+
+                goto_student_records(page, cfg=cfg, log_fn=log_fn, run_id=run_id)
+                _log(log_fn, f"[{run_id}] SERVE searching SSID {student.ssid} under '{cfg['workability']['search_project']}'...")
+                search_by_ssid(page, student.ssid, cfg)
+
+                outcome = determine_search_outcome(page, timeout_ms=5000)
+                if outcome != "FOUND":
+                    details = "Student not found in WAI; Serve dry-run skipped."
+                    _log(log_fn, f"[{run_id}] SERVE_NOT_FOUND: {student.ssid} ({display_name})")
+                    _user(f"SERVE_NOT_FOUND||display_name={display_name}", ui_hold_default)
+                    _inc("serve_not_found")
+                    append_ledger_xlsx(ledger_path, {
+                        "run_id": run_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "ssid": student.ssid,
+                        "student_name": display_name,
+                        "action": "SERVE_NOT_FOUND",
+                        "details": details,
+                        "screenshot": "",
+                        "trace": "",
+                    })
+                    if trace_on_failure:
+                        context.tracing.stop()
+                    continue
+
+                owning_org = get_found_row_owning_org(page, student.ssid)
+                _log(log_fn, f"[{run_id}] SERVE owning org for {student.ssid}: {owning_org!r}")
+
+                if not is_already_owned_by_us(owning_org, cfg):
+                    details = f"Student found in WAI but not owned by configured org; owning org={owning_org!r}."
+                    _log(log_fn, f"[{run_id}] SERVE_SKIPPED_NOT_OWNED: {student.ssid} ({display_name}) -> {details}")
+                    _user(f"SERVE_SKIPPED_NOT_OWNED||display_name={display_name}", ui_hold_default)
+                    _inc("serve_skipped_not_owned")
+                    append_ledger_xlsx(ledger_path, {
+                        "run_id": run_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "ssid": student.ssid,
+                        "student_name": display_name,
+                        "action": "SERVE_SKIPPED_NOT_OWNED",
+                        "details": details,
+                        "screenshot": "",
+                        "trace": "",
+                    })
+                    if trace_on_failure:
+                        context.tracing.stop()
+                    continue
+
+                _log(log_fn, f"[{run_id}] SERVE opening Edit for owned student {student.ssid} ({display_name})")
+                open_existing_student_edit(page)
+                service_results = fill_array_of_services_dry_run(page, hours=hours, log_fn=log_fn, run_id=run_id)
+
+                action = "SERVE_DRY_RUN_FILLED"
+                if save_after_fill:
+                    _log(log_fn, f"[{run_id}] SERVE saving Array of Services for {student.ssid} ({display_name})")
+                    click_save_robust(page, timeout_ms=15000, log_fn=log_fn, run_id=run_id)
+                    page.wait_for_timeout(1000)
+                    action = "SERVE_SAVED"
+
+                screenshot_prefix = "serve_saved" if save_after_fill else "serve_dry_run"
+                screenshot_path = os.path.join("output", "screenshots", f"{screenshot_prefix}_{run_id}_{student.ssid}.png")
+                try:
+                    page.screenshot(path=screenshot_path, full_page=False)
+                except Exception:
+                    screenshot_path = ""
+
+                verified_summary = "; ".join(
+                    f"{r.get('rowLabel')}={r.get('value')} ({r.get('action')})"
+                    for r in service_results
+                )
+
+                if save_after_fill:
+                    details = (
+                        "0.5's entered into 6 WAI fields.  "
+                        f"Rows: {', '.join(label for label, _ in ARRAY_SERVICE_TARGETS)}; "
+                        f"Verified: {verified_summary}"
+                    )
+                    _inc("serve_saved")
+                else:
+                    details = (
+                        "Serve dry-run filled Array of Services WAI hours without saving. "
+                        f"Rows: {', '.join(label for label, _ in ARRAY_SERVICE_TARGETS)}; "
+                        f"Verified: {verified_summary}"
+                    )
+                    _inc("serve_dry_run_filled")
+
+                _log(log_fn, f"[{run_id}] {action}: {student.ssid} ({display_name}) -> {details}")
+                _user(f"{action}||display_name={display_name}", ui_hold_default)
+                append_ledger_xlsx(ledger_path, {
+                    "run_id": run_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "ssid": student.ssid,
+                    "student_name": display_name,
+                    "action": action,
+                    "details": details,
+                    "screenshot": screenshot_path,
+                    "trace": "",
+                })
+
+                if trace_on_failure:
+                    context.tracing.stop()
+
+                if pause_after_first_fill:
+                    pause_desc = "saved" if save_after_fill else "filled"
+                    _log(log_fn, f"[{run_id}] SERVE {serve_mode_label} paused after first {pause_desc} owned student.")
+                    if pause_fn:
+                        pause_fn(page)
+                    else:
+                        input(f"{serve_mode_label} {pause_desc} the first owned student. Press Enter to close browser...")
+                    break
+
+            except Exception as exc:
+                if trace_on_failure:
+                    trace_path = os.path.join("output", "traces", f"trace_{run_id}_{student.ssid}.zip")
+                    try:
+                        context.tracing.stop(path=trace_path)
+                    except Exception:
+                        trace_path = ""
+
+                try:
+                    screenshot_path = os.path.join("output", "screenshots", f"serve_error_{run_id}_{student.ssid}.png")
+                    page.screenshot(path=screenshot_path, full_page=True)
+                except Exception:
+                    screenshot_path = ""
+
+                try:
+                    close_transient_overlays(page)
+                except Exception:
+                    pass
+
+                _log(log_fn, f"[{run_id}] SERVE_ERROR: {student.ssid} ({display_name}) -> {exc}")
+                _user(f"SERVE_ERROR||display_name={display_name}", ui_hold_default)
+                _inc("errors")
+                append_ledger_xlsx(ledger_path, {
+                    "run_id": run_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "ssid": student.ssid,
+                    "student_name": display_name,
+                    "action": "SERVE_ERROR",
+                    "details": str(exc),
+                    "screenshot": screenshot_path,
+                    "trace": trace_path,
+                })
+
+                if stop_on_error:
+                    raise
+                if SERVE_LAYOUT_CHANGED_PREFIX in str(exc):
+                    raise RuntimeError(str(exc))
+                continue
+
+        _log(log_fn, f"[{run_id}] {serve_mode_label} complete. Ledger: {ledger_path}")
+        _user(serve_complete_message, 0.5)
+
+        context.close()
+        browser.close()
+
+        print(serve_console_complete)
+        return {"run_id": run_id, "ledger_path": ledger_path, **stats}
 
 
 if __name__ == "__main__":
