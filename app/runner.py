@@ -146,7 +146,7 @@ def click_save_robust(
 
     # 3) Scroll into view (some layouts require this)
     try:
-        save_btn.scroll_into_view_if_needed(timeout=3000)
+        save_btn.scroll_into_view_if_needed(timeout=300)
     except Exception:
         pass
 
@@ -304,11 +304,18 @@ def get_found_row_owning_org(page, expected_ssid: str, timeout_ms: int = 5000) -
     row = page.locator("tr").filter(has_text=re.compile(re.escape(expected_ssid))).first
     row.wait_for(state="visible", timeout=timeout_ms)
 
-    owning_td = row.locator("td").nth(4)  # 5th td
+    owning_td = row.locator("td").nth(4)
     owning_td.wait_for(state="visible", timeout=timeout_ms)
 
-    owning_text = " ".join((owning_td.inner_text() or "").split())
-    return owning_text
+    # Wait briefly for text to populate (handles late render)
+    for _ in range(max(1, timeout_ms // 100)):
+        txt = " ".join((owning_td.inner_text() or "").split())
+        if txt:
+            return txt
+        page.wait_for_timeout(100)
+
+    return " ".join((owning_td.inner_text() or "").split())
+
 
 
 def is_already_owned_by_us(found_owning_org: str, cfg: Dict[str, Any]) -> bool:
@@ -641,21 +648,77 @@ def set_search_project_scope(page, cfg: Dict[str, Any]) -> None:
     page.get_by_label("WAI Project").click()
     page.get_by_label(target, exact=True).click()
 
+    # Optional but recommended: wait for project-scope refresh to settle
+    loader = page.get_by_test_id("loader")
+    try:
+        loader.wait_for(state="visible", timeout=1500)
+    except Exception:
+        pass
+    try:
+        if loader.count() > 0 and loader.is_visible():
+            try:
+                loader.wait_for(state="hidden", timeout=10_000)
+            except Exception:
+                loader.wait_for(state="detached", timeout=10_000)
+    except Exception:
+        pass
+
+
 
 def search_by_ssid(page, ssid: str, cfg: Dict[str, Any]) -> None:
     set_search_project_scope(page, cfg)
+
     page.get_by_placeholder("SSID").fill(ssid)
     page.get_by_role("button", name="Search").click()
 
+    # --- Wait for async search to settle (race-condition guard) ---
+    loader = page.get_by_test_id("loader")
+
+    # Give loader a short chance to appear (handles "appears slightly after click")
+    try:
+        loader.wait_for(state="visible", timeout=1500)
+    except Exception:
+        pass
+
+    # If it is visible, wait for it to finish (hidden or removed)
+    try:
+        if loader.count() > 0 and loader.is_visible():
+            try:
+                loader.wait_for(state="hidden", timeout=10_000)
+            except Exception:
+                loader.wait_for(state="detached", timeout=10_000)
+    except Exception:
+        # Don't fail the run over loader weirdness; outcome logic will still guard too.
+        pass
+
+
 
 def determine_search_outcome(page, timeout_ms: int = 3000) -> str:
+    loader = page.get_by_test_id("loader")
     edit_btn = page.get_by_role("button", name="Edit")
     zero_msg = page.locator("p").filter(has_text=ZERO_RESULTS_RE).first
 
     step_ms = 100
     steps = max(1, timeout_ms // step_ms)
 
+    # Give the loader a short chance to appear (handles "appears a beat later")
+    try:
+        loader.wait_for(state="visible", timeout=min(1500, timeout_ms))
+    except Exception:
+        pass
+
     for _ in range(steps):
+        # If the loader is visible, the page is still resolving results.
+        # Do NOT trust "0 records" or absence of Edit yet.
+        try:
+            if loader.count() > 0 and loader.is_visible():
+                page.wait_for_timeout(step_ms)
+                continue
+        except Exception:
+            # If loader lookup is flaky for any reason, don't fail the run; fall through.
+            pass
+
+        # Now we're in a "settled enough" moment — safe to evaluate outcome.
         try:
             if edit_btn.is_visible():
                 return "FOUND"
@@ -763,7 +826,7 @@ def select_combobox_option(page, label_regex, option_text: str, timeout_ms: int 
             option = listbox.get_by_role("option", name=option_re).first
 
             expect(option).to_be_visible(timeout=timeout_ms)
-            option.scroll_into_view_if_needed(timeout=2000)
+            option.scroll_into_view_if_needed(timeout=300)
 
             # Normal click first
             option.click(timeout=3000)
@@ -786,7 +849,7 @@ def select_combobox_option(page, label_regex, option_text: str, timeout_ms: int 
             if attempt == 3:
                 try:
                     option = page.get_by_role("option", name=option_re).first
-                    option.scroll_into_view_if_needed(timeout=2000)
+                    option.scroll_into_view_if_needed(timeout=300)
                     option.click(timeout=3000, force=True)
                     break
                 except Exception as e2:
@@ -808,7 +871,7 @@ def select_combobox_option(page, label_regex, option_text: str, timeout_ms: int 
 
 def select_radio_by_label_text(page, label_text: str) -> None:
     try:
-        page.get_by_role("radio", name=re.compile(rf"^{re.escape(label_text)}$", re.I)).check(timeout=1500)
+        page.get_by_role("radio", name=re.compile(rf"^{re.escape(label_text)}$", re.I)).check(timeout=100)
         return
     except Exception:
         pass
@@ -837,7 +900,7 @@ def select_gender(page, gender_ui: str) -> None:
     target_text = text_map.get(gender_ui, gender_ui)
 
     try:
-        page.get_by_role("radio", name=re.compile(rf"^{re.escape(target_text)}$", re.I)).check(timeout=1500)
+        page.get_by_role("radio", name=re.compile(rf"^{re.escape(target_text)}$", re.I)).check(timeout=100)
         return
     except Exception:
         pass
@@ -887,6 +950,7 @@ def create_new_student(
     on_form_expanded=None,
 ):
     page.get_by_role("button", name="New Student").click()
+    expect(page.get_by_placeholder("First Name")).to_be_visible(timeout=10000)
 
     page.get_by_placeholder("First Name").fill(student.first_name)
     page.get_by_placeholder("Last Name").fill(student.last_name)
@@ -900,6 +964,22 @@ def create_new_student(
     create_project = cfg["workability"]["create_project"]
     page.get_by_label(re.compile(r"WAI Project", re.I)).click()
     page.get_by_label(create_project, exact=True).click()
+
+    loader = page.get_by_test_id("loader")
+    try:
+        loader.wait_for(state="visible", timeout=1500)
+    except Exception:
+        pass
+    try:
+        if loader.count() > 0 and loader.is_visible():
+            try:
+                loader.wait_for(state="hidden", timeout=10_000)
+            except Exception:
+                loader.wait_for(state="detached", timeout=10_000)
+    except Exception:
+        pass
+
+
 
     if log_fn and run_id:
         _log(log_fn, f"[{run_id}] Selecting school: {student.wai_school}")
