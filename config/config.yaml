@@ -195,4 +195,8 @@ school_mapping:
   "SE - WE - LOS OSOS HS": { wai_school: "Los Osos HS (San Bernardino County Office of Education)", active: true }
   "SE - WE - RANCHO CUC HS": { wai_school: "Rancho Cucamonga HS (San Bernardino County Office of Education)", active: true }
   "SE - WE - UPLAND HS": { wai_school: "Upland HS (San Bernardino County Office of Education)", active: true }
+  "SE - EV - BARBARA PHELPS SP ED": { wai_school: "Barbara Phelps SP ED (San Bernardino County Office of Education)", active: true }
+  "SE - WE - GIBSON HS": { wai_school: "Dorothy Gibson County High School SP ED (San Bernardino County Office of Education)", active: true }
+  "SE - INDEPENDENT STUDY": { wai_school: "Independent Study SP ED (San Bernardino County Office of Education)", active: true }
+  "SE - DM - TRONA": { wai_school: "Trona HS (San Bernardino County Office of Education)", active: true }
   
