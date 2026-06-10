@@ -1,0 +1,3 @@
+python -m app.address_patch --excel "input\Pick Up Addresses Test 3.xlsx" --save --pause-after-first
+
+C:\Users\Emmanuel.Encarnacion.SBCSS-AD\AppData\Roaming\npm\codex.cmd

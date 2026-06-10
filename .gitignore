@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+*.lnk
+*.code-workspace
+
+# Logs / temp
+*.log
+
+# Output artifacts (runtime only - screenshots, traces, logs)
+output/
+
+# Input data files (contain student PII) - only allow the header template
+input/*.xlsx
+!input/Input_TEMPLATE.xlsx
+input/*/
+
+# Student data files anywhere else in the repo
+*students*.xlsx
+
+# Dev/scratch folders (never commit)
+dev/
+dev_screenshots/
+BU/
+Unused/
+
