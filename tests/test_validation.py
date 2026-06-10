@@ -3,6 +3,8 @@ import unittest
 from copy import deepcopy
 from datetime import date
 from pathlib import Path
+import shutil
+import uuid
 
 from openpyxl import Workbook
 
@@ -47,6 +49,15 @@ class ValidationTests(unittest.TestCase):
             self.cfg,
             validation_log_fn=(logs.append if logs is not None else None),
             today=TODAY,
+        )
+
+    def validate_address_patch(self, row, logs=None):
+        return validate_and_prepare(
+            row,
+            self.cfg,
+            validation_log_fn=(logs.append if logs is not None else None),
+            today=TODAY,
+            require_address_fields=True,
         )
 
     def assert_invalid(self, row, expected_text):
@@ -218,6 +229,34 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(bad[0].action, "NEEDS_INPUT_DATA")
         self.assertIn("Duplicate State Student ID", bad[0].details)
 
+    def test_address_patch_requires_expanded_fields(self):
+        row = self.base_row()
+        row[self.cfg["columns"]["street_address"]] = "1537 W 7th Street #101"
+        row[self.cfg["columns"]["city"]] = "Upland"
+        row[self.cfg["columns"]["state"]] = "ca"
+        row[self.cfg["columns"]["zip"]] = 91786
+        row[self.cfg["columns"]["phone_number"]] = "(626) 840-3963"
+        row[self.cfg["columns"]["parent_name"]] = "Elly Rejuso"
+
+        student = self.validate_address_patch(row)
+        self.assertEqual(student.state, "CA")
+        self.assertEqual(student.zip_code, "91786")
+        self.assertEqual(student.parent_name, "Elly Rejuso")
+
+        row = self.base_row()
+        row[self.cfg["columns"]["street_address"]] = ""
+        row[self.cfg["columns"]["city"]] = "Upland"
+        row[self.cfg["columns"]["state"]] = "CA"
+        row[self.cfg["columns"]["zip"]] = 91786
+        row[self.cfg["columns"]["phone_number"]] = "(626) 840-3963"
+        row[self.cfg["columns"]["parent_name"]] = "Elly Rejuso"
+        self.assert_invalid_address_patch(row, "Street address is required")
+
+    def assert_invalid_address_patch(self, row, expected_text):
+        with self.assertRaises(ValueError) as cm:
+            self.validate_address_patch(row)
+        self.assertIn(expected_text, str(cm.exception))
+
 
 class HeaderValidationTests(unittest.TestCase):
     @classmethod
@@ -278,7 +317,52 @@ class HeaderValidationTests(unittest.TestCase):
         try:
             with self.assertRaises(ValueError) as cm:
                 read_excel_rows(str(path), cfg=self.cfg)
-            self.assertIn("unexpected extra header", str(cm.exception))
+            self.assertIn("expected 'Street address'", str(cm.exception))
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_expanded_address_headers_pass_when_required(self):
+        headers = expected_input_headers(self.cfg) + [
+            self.cfg["columns"]["street_address"],
+            self.cfg["columns"]["city"],
+            self.cfg["columns"]["state"],
+            self.cfg["columns"]["zip"],
+            self.cfg["columns"]["phone_number"],
+            self.cfg["columns"]["parent_name"],
+        ]
+        row = [
+            "Kenneth Leandro",
+            "Rejuso",
+            "3448323742",
+            "06/04/2007",
+            "M",
+            "12",
+            "Autism (AUT)",
+            "N",
+            "Filipino",
+            "SE - WE - UPLAND HS",
+            "1537 W 7th Street #101",
+            "Upland",
+            "CA",
+            "91786",
+            "(626) 840-3963",
+            "Elly Rejuso",
+        ]
+        path = self.write_workbook(headers, [row])
+        try:
+            rows = read_excel_rows(str(path), cfg=self.cfg, require_address_columns=True)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][self.cfg["columns"]["street_address"]], "1537 W 7th Street #101")
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_address_headers_required_for_address_patch_mode(self):
+        headers = expected_input_headers(self.cfg)
+        path = self.write_workbook(headers)
+        try:
+            with self.assertRaises(ValueError) as cm:
+                read_excel_rows(str(path), cfg=self.cfg, require_address_columns=True)
+            self.assertIn("missing required address headers", str(cm.exception))
         finally:
             path.unlink(missing_ok=True)
 
@@ -300,8 +384,10 @@ class HeaderValidationTests(unittest.TestCase):
         workbook_path = self.write_workbook(headers, [row])
         dev_logs = []
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            audit_path = Path(tmpdir) / "logs" / "input_sanitization.log"
+        tmpdir = Path("output") / f"test_audit_{uuid.uuid4().hex}"
+        try:
+            tmpdir.mkdir(parents=True, exist_ok=True)
+            audit_path = tmpdir / "logs" / "input_sanitization.log"
             audit_log = make_input_audit_logger(str(audit_path), "test-run", log_fn=dev_logs.append)
 
             rows = read_excel_rows(str(workbook_path), cfg=self.cfg, log_fn=audit_log)
@@ -320,6 +406,8 @@ class HeaderValidationTests(unittest.TestCase):
             self.assertIn("falling back to 'Other'", text)
             self.assertIn("case-insensitive lookup", text)
             self.assertTrue(any("falling back to 'Other'" in msg for msg in dev_logs))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
         self.assertFalse(audit_path.exists())
         workbook_path.unlink(missing_ok=True)

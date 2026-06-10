@@ -39,6 +39,12 @@ columns:
   ethcd: "EthCd"
   race1: "Description_STU_RC1"
   aeries_school: "School name"
+  street_address: "Street address"
+  city: "City"
+  state: "State"
+  zip: "Zip"
+  phone_number: "Phone Number"
+  parent_name: "Parent Name"
 
 run:
   headless: false

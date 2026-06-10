@@ -365,6 +365,22 @@ def norm(s: Any) -> str:
 
 
 EXCEL_ROW_NUM_KEY = "__excel_row_num__"
+ADDRESS_COLUMN_KEYS = [
+    "street_address",
+    "city",
+    "state",
+    "zip",
+    "phone_number",
+    "parent_name",
+]
+ADDRESS_REQUIRED_COLUMN_KEYS = [
+    "street_address",
+    "city",
+    "state",
+    "zip",
+    "phone_number",
+    "parent_name",
+]
 
 
 def school_lookup_key(s: Any) -> str:
@@ -634,6 +650,12 @@ class Student:
     race_ui: str
     aeries_school: str
     wai_school: str
+    street_address: str = ""
+    city: str = ""
+    state: str = ""
+    zip_code: str = ""
+    phone_number: str = ""
+    parent_name: str = ""
 
 
 @dataclass
@@ -664,6 +686,7 @@ def validate_and_prepare(
     cfg: Dict[str, Any],
     validation_log_fn=None,
     today: date | None = None,
+    require_address_fields: bool = False,
 ) -> Student:
     cols = cfg["columns"]
     today = today or date.today()
@@ -793,6 +816,43 @@ def validate_and_prepare(
         except (KeyError, ValueError) as e:
             add_error(str(e))
 
+    street_address = norm(row.get(cols.get("street_address", "")))
+    city = norm(row.get(cols.get("city", "")))
+    state = norm(row.get(cols.get("state", ""))).upper()
+    zip_code = normalized_integral_text(row.get(cols.get("zip", "")))
+    phone_number = norm(row.get(cols.get("phone_number", "")))
+
+    parent_name_raw = row.get(cols.get("parent_name", ""))
+    parent_name, parent_name_changes = sanitize_person_name_value(parent_name_raw)
+    if parent_name_changes and validation_log_fn:
+        _log(
+            validation_log_fn,
+            f"Excel row {excel_row_num}: Parent Name sanitized for WAI contact field: "
+            f"{_excel_log_value(parent_name_raw)!r} -> {_excel_log_value(parent_name)!r} "
+            f"({'; '.join(parent_name_changes)}).",
+        )
+
+    if require_address_fields:
+        if not street_address:
+            add_error("Street address is required for address patch")
+        if not city:
+            add_error("City is required for address patch")
+        if not state:
+            add_error("State is required for address patch")
+        elif not re.fullmatch(r"[A-Z]{2}", state):
+            add_error(f"State must be a 2-letter code for address patch; got {state!r}")
+        if not zip_code:
+            add_error("Zip is required for address patch")
+        elif not re.fullmatch(r"\d{5}(?:-\d{4})?", zip_code):
+            add_error(f"Zip must be 5 digits or ZIP+4 for address patch; got {zip_code!r}")
+        if not phone_number:
+            add_error("Phone Number is required for address patch")
+        if not parent_name:
+            if norm(parent_name_raw):
+                add_error("Parent Name must contain at least one alphabetic character for address patch")
+            else:
+                add_error("Parent Name is required for address patch")
+
     if errors:
         raise ValueError("; ".join(errors))
 
@@ -808,6 +868,12 @@ def validate_and_prepare(
         race_ui=race_ui,
         aeries_school=aeries_school,
         wai_school=wai_school,
+        street_address=street_address,
+        city=city,
+        state=state,
+        zip_code=zip_code,
+        phone_number=phone_number,
+        parent_name=parent_name,
     )
 
 
@@ -816,6 +882,7 @@ def prepare_input_rows(
     cfg: Dict[str, Any],
     validation_log_fn=None,
     today: date | None = None,
+    require_address_fields: bool = False,
 ) -> Tuple[List[PreparedInputRow], List[InvalidInputRow]]:
     prepared: List[PreparedInputRow] = []
     invalid: List[InvalidInputRow] = []
@@ -833,6 +900,7 @@ def prepare_input_rows(
                 cfg,
                 validation_log_fn=validation_log_fn,
                 today=today,
+                require_address_fields=require_address_fields,
             )
             if student.ssid in seen_ssid_rows:
                 first_row = seen_ssid_rows[student.ssid]
@@ -892,8 +960,18 @@ def expected_input_headers(cfg: Dict[str, Any]) -> List[str]:
     ]
 
 
-def validate_input_headers(headers: List[str], cfg: Dict[str, Any]) -> None:
+def expected_address_headers(cfg: Dict[str, Any]) -> List[str]:
+    cols = cfg["columns"]
+    return [cols[key] for key in ADDRESS_COLUMN_KEYS if cols.get(key)]
+
+
+def validate_input_headers(
+    headers: List[str],
+    cfg: Dict[str, Any],
+    require_address_columns: bool = False,
+) -> None:
     expected = expected_input_headers(cfg)
+    expected_address = expected_address_headers(cfg)
     errors = []
 
     for i, expected_header in enumerate(expected, start=1):
@@ -903,19 +981,44 @@ def validate_input_headers(headers: List[str], cfg: Dict[str, Any]) -> None:
                 f"column {get_column_letter(i)} expected {expected_header!r}, got {actual!r}"
             )
 
-    extra_headers = [
-        (i, h)
-        for i, h in enumerate(headers[len(expected):], start=len(expected) + 1)
-        if norm(h)
-    ]
-    for i, extra in extra_headers:
-        errors.append(f"unexpected extra header in column {get_column_letter(i)}: {extra!r}")
+    extra_headers = [h for h in headers[len(expected):] if norm(h)]
+    allowed_prefix_len = 0
+    for i in range(len(extra_headers) + 1):
+        if extra_headers[:i] == expected_address[:i]:
+            allowed_prefix_len = i
+        else:
+            break
+
+    for offset, extra in enumerate(extra_headers[:allowed_prefix_len], start=1):
+        expected_extra = expected_address[offset - 1]
+        if extra != expected_extra:
+            idx = len(expected) + offset
+            errors.append(f"column {get_column_letter(idx)} expected {expected_extra!r}, got {extra!r}")
+
+    if extra_headers[allowed_prefix_len:]:
+        for offset, extra in enumerate(extra_headers[allowed_prefix_len:], start=allowed_prefix_len + 1):
+            idx = len(expected) + offset
+            expected_extra = expected_address[offset - 1] if offset - 1 < len(expected_address) else None
+            if expected_extra:
+                errors.append(f"column {get_column_letter(idx)} expected {expected_extra!r}, got {extra!r}")
+            else:
+                errors.append(f"unexpected extra header in column {get_column_letter(idx)}: {extra!r}")
+
+    if require_address_columns and extra_headers != expected_address:
+        if len(extra_headers) < len(expected_address):
+            missing = expected_address[len(extra_headers):]
+            errors.append(f"missing required address headers at end of sheet: {missing!r}")
 
     if errors:
         raise ValueError("INPUT_HEADER_ERROR: " + "; ".join(errors))
 
 
-def read_excel_rows(excel_path: str, cfg: Dict[str, Any] | None = None, log_fn=None) -> List[Dict[str, Any]]:
+def read_excel_rows(
+    excel_path: str,
+    cfg: Dict[str, Any] | None = None,
+    log_fn=None,
+    require_address_columns: bool = False,
+) -> List[Dict[str, Any]]:
     wb = load_workbook(excel_path, read_only=True, data_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
@@ -931,7 +1034,7 @@ def read_excel_rows(excel_path: str, cfg: Dict[str, Any] | None = None, log_fn=N
         headers.append(clean_header)
 
     if cfg is not None:
-        validate_input_headers(headers, cfg)
+        validate_input_headers(headers, cfg, require_address_columns=require_address_columns)
 
     out: List[Dict[str, Any]] = []
     name_headers = set()
@@ -1551,6 +1654,47 @@ def select_combobox_option(
     page.wait_for_timeout(100)
 
 
+def select_combobox_locator_option(
+    page,
+    combo,
+    option_text: str,
+    field_name: str,
+    timeout_ms: int = 8000,
+) -> None:
+    close_transient_overlays(page)
+    expect(combo).to_be_visible(timeout=timeout_ms)
+    expect(combo).to_be_enabled(timeout=timeout_ms)
+
+    try:
+        current = norm(combo.inner_text(timeout=1000))
+        if current.casefold() == norm(option_text).casefold():
+            return
+    except Exception:
+        pass
+
+    combo.click(timeout=3000)
+    listbox = page.get_by_role("listbox")
+    expect(listbox).to_be_visible(timeout=timeout_ms)
+
+    option_re = re.compile(rf"^{re.escape(option_text)}$", re.I)
+    option = listbox.get_by_role("option", name=option_re).first
+    expect(option).to_be_visible(timeout=timeout_ms)
+    option.scroll_into_view_if_needed(timeout=min(timeout_ms, 3000))
+    option.click(timeout=3000)
+
+    close_transient_overlays(page)
+    try:
+        expect(page.get_by_role("listbox")).to_be_hidden(timeout=2000)
+    except Exception:
+        pass
+
+    try:
+        current = norm(combo.inner_text(timeout=1000))
+        if current.casefold() != norm(option_text).casefold():
+            raise RuntimeError(f"{field_name} still shows {current!r} after selecting {option_text!r}")
+    except Exception:
+        pass
+
 
 def select_radio_by_label_text(page, label_text: str) -> None:
     try:
@@ -1706,6 +1850,258 @@ def create_new_student(
         run_id=run_id,
         toast_regex=re.compile(r"successfully\s+saved", re.I),
     )
+
+
+def fill_text_input(
+    page,
+    patterns: List[re.Pattern],
+    value: str,
+    field_name: str,
+    timeout_ms: int = 8000,
+    selectors: List[str] | None = None,
+) -> None:
+    last_err = None
+    for selector in selectors or []:
+        try:
+            locator = page.locator(selector).first
+            expect(locator).to_be_visible(timeout=timeout_ms)
+            locator.fill("")
+            locator.fill(value)
+            return
+        except Exception as e:
+            last_err = e
+
+    for pattern in patterns:
+        try:
+            locator = page.get_by_label(pattern).first
+            expect(locator).to_be_visible(timeout=timeout_ms)
+            locator.fill("")
+            locator.fill(value)
+            return
+        except Exception as e:
+            last_err = e
+
+        try:
+            locator = page.get_by_placeholder(pattern).first
+            expect(locator).to_be_visible(timeout=timeout_ms)
+            locator.fill("")
+            locator.fill(value)
+            return
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"Could not locate editable field for {field_name}: {last_err}")
+
+
+def read_text_input_value(
+    page,
+    selectors: List[str],
+    field_name: str,
+    timeout_ms: int = 5000,
+) -> str:
+    last_err = None
+    for selector in selectors:
+        try:
+            matches = page.locator(selector)
+            matches.first.wait_for(state="attached", timeout=timeout_ms)
+            blank_visible_value = None
+
+            for i in range(matches.count()):
+                locator = matches.nth(i)
+                try:
+                    if not locator.is_visible():
+                        continue
+
+                    value = locator.input_value(timeout=timeout_ms).strip()
+                    if not value:
+                        attr_value = locator.get_attribute("value", timeout=timeout_ms)
+                        value = (attr_value or "").strip()
+
+                    if value:
+                        return value
+
+                    blank_visible_value = ""
+                except Exception as e:
+                    last_err = e
+
+            if blank_visible_value is not None:
+                return blank_visible_value
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"Could not read field value for {field_name}: {last_err}")
+
+
+def checkbox_is_checked(locator) -> bool:
+    try:
+        return bool(locator.is_checked(timeout=1000))
+    except Exception:
+        return bool(locator.evaluate(
+            """el => {
+                if (typeof el.checked === 'boolean') return el.checked;
+                const aria = el.getAttribute('aria-checked');
+                if (aria !== null) return aria === 'true';
+                const state = el.getAttribute('data-state') || el.closest('[data-state]')?.getAttribute('data-state');
+                return state === 'checked';
+            }"""
+        ))
+
+
+def open_addresses_tab(page, log_fn=None, run_id=None, timeout_ms: int = 10000) -> None:
+    def _l(msg: str):
+        if log_fn and run_id:
+            _log(log_fn, f"[{run_id}] {msg}")
+        elif log_fn:
+            _log(log_fn, msg)
+
+    close_transient_overlays(page)
+    tab_name = re.compile(r"^Addresses$", re.I)
+    candidates = [
+        page.get_by_role("tab", name=tab_name).first,
+        page.get_by_role("link", name=tab_name).first,
+        page.get_by_role("button", name=tab_name).first,
+        page.get_by_text("Addresses", exact=True).first,
+    ]
+
+    last_err = None
+    for attempt in range(1, 4):
+        for candidate in candidates:
+            try:
+                if candidate.count() == 0 or not candidate.is_visible():
+                    continue
+                _l(f"Opening Addresses tab (attempt {attempt}/3)...")
+                candidate.scroll_into_view_if_needed(timeout=3000)
+                candidate.click(timeout=5000)
+                wait_for_search_loader_to_settle(page)
+                page.locator("#studentAddress").first.wait_for(state="visible", timeout=timeout_ms)
+                return
+            except Exception as e:
+                last_err = e
+                close_transient_overlays(page)
+                page.wait_for_timeout(250)
+
+    raise RuntimeError(f"Could not open Addresses tab: {last_err}")
+
+
+def overwrite_existing_student_address(
+    page,
+    student: Student,
+    log_fn=None,
+    run_id=None,
+) -> Dict[str, str]:
+    def _l(msg: str):
+        if log_fn and run_id:
+            _log(log_fn, f"[{run_id}] {msg}")
+        elif log_fn:
+            _log(log_fn, msg)
+
+    _l("Reading Parent/Guardian Street Address before editing address fields.")
+    parent_guardian_address = read_text_input_value(
+        page,
+        [
+            "#parentGuardianAddress",
+            "input[aria-describedby='parentGuardianAddress']",
+            "input[name='parentGuardianAddress']",
+        ],
+        "Parent/Guardian Street Address",
+    )
+    _l(f"Parent/Guardian Street Address value length before edits: {len(parent_guardian_address)}.")
+
+    field_specs = [
+        (
+            "street_address",
+            student.street_address,
+            "Street address",
+            [
+                re.compile(r"Street\s+Address", re.I),
+                re.compile(r"Address(?:\s+Line)?\s*1", re.I),
+                re.compile(r"^Address$", re.I),
+            ],
+            [
+                "#studentAddress",
+                "input[aria-describedby='studentAddress']",
+                "input[placeholder='Street Address']",
+            ],
+        ),
+        (
+            "city",
+            student.city,
+            "City",
+            [re.compile(r"^City$", re.I)],
+            [
+                "#studentCity",
+                "input[aria-describedby='studentCity']",
+                "input[placeholder='City']",
+            ],
+        ),
+        (
+            "zip_code",
+            student.zip_code,
+            "Zip",
+            [re.compile(r"Zip(\s*Code)?", re.I), re.compile(r"Postal", re.I)],
+            [],
+        ),
+        (
+            "phone_number",
+            student.phone_number,
+            "Phone Number",
+            [re.compile(r"Phone(\s*Number)?", re.I), re.compile(r"Primary\s+Phone", re.I)],
+            [],
+        ),
+        (
+            "parent_name",
+            student.parent_name,
+            "Parent Name",
+            [
+                re.compile(r"^Name\(s\)$", re.I),
+                re.compile(r"Parent\s+Name", re.I),
+                re.compile(r"Parent\s*/\s*Guardian", re.I),
+                re.compile(r"Guardian\s+Name", re.I),
+                re.compile(r"Contact\s+Name", re.I),
+            ],
+            [
+                "#parentGuardianNames",
+                "input[aria-describedby='parentGuardianNames']",
+                "input[placeholder='Name(s)']",
+            ],
+        ),
+    ]
+
+    for _, value, field_name, patterns, selectors in field_specs:
+        _l(f"Updating {field_name}: {value}")
+        fill_text_input(page, patterns, value, field_name, selectors=selectors)
+
+    if parent_guardian_address:
+        _l("Parent/Guardian Street Address already has a value; skipping Same address as student.")
+    else:
+        _l("Parent/Guardian Street Address is blank; checking Same address as student.")
+        same_address = page.locator("#sameAddress").first
+        expect(same_address).to_be_visible(timeout=8000)
+        if checkbox_is_checked(same_address):
+            _l("Same address as student is already checked; leaving it unchanged.")
+        else:
+            same_address.check(timeout=3000)
+
+    _l(f"Updating Parent/Guardian Phone: {student.phone_number}")
+    fill_text_input(
+        page,
+        [re.compile(r"Phone(\s*Number)?", re.I)],
+        student.phone_number,
+        "Parent/Guardian Phone",
+        selectors=[
+            "#parentGuardianPhone",
+            "input[aria-describedby='parentGuardianPhone']",
+        ],
+    )
+
+    return {
+        "street_address": student.street_address,
+        "city": student.city,
+        "state": student.state,
+        "zip_code": student.zip_code,
+        "phone_number": student.phone_number,
+        "parent_name": student.parent_name,
+    }
 
 
 ARRAY_SERVICE_TARGETS = [
@@ -2745,6 +3141,341 @@ def run_serve(
         browser.close()
 
         print(serve_console_complete)
+        return {"run_id": run_id, "ledger_path": ledger_path, **stats}
+
+
+def run_address_patch(
+    excel_path: str,
+    config_path: str = "config/config.yaml",
+    username: str | None = None,
+    password: str | None = None,
+    log_fn=None,
+    override_headless: bool | None = None,
+    override_slow_mo_ms: int | None = None,
+    stop_event=None,
+    user_log_fn=None,
+    pause_after_first_patch: bool = False,
+    pause_fn=None,
+    save_after_fill: bool = False,
+) -> Dict[str, Any]:
+    cfg = load_config(config_path)
+
+    ui_hold_default = float(cfg.get("ui", {}).get("min_status_seconds", 1.5))
+
+    def _user(msg: str, min_hold_sec: float = 0.0):
+        if user_log_fn:
+            user_log_fn(msg)
+        else:
+            _log(log_fn, msg)
+        hold = float(min_hold_sec or 0.0)
+        if hold > 0:
+            time.sleep(hold)
+
+    def _should_stop() -> bool:
+        return bool(stop_event and stop_event.is_set())
+
+    if "search_project" not in cfg["workability"]:
+        raise KeyError("config.yaml workability must include search_project.")
+
+    ledger_path = cfg["ledger"]["path"]
+    ensure_dir("output/screenshots")
+    ensure_dir("output/traces")
+    ensure_dir(os.path.dirname(ledger_path))
+
+    run_id = str(uuid.uuid4())[:8]
+
+    username_default = cfg.get("credentials", {}).get("username", "")
+    if username is None or not str(username).strip():
+        username = username_default or input("WAI Username (email): ").strip()
+
+    if password is None:
+        password = getpass("WAI Password: ")
+
+    patch_mode_label = "Address patch save-run" if save_after_fill else "Address patch dry-run"
+    patch_start_message = (
+        "Starting Workabili-Bot3000 address patch save-run..."
+        if save_after_fill
+        else "Starting Workabili-Bot3000 address patch dry-run..."
+    )
+    patch_complete_message = (
+        "Address patch completed. Check the ledger for details."
+        if save_after_fill
+        else "Address patch dry-run complete. Check the ledger for details."
+    )
+    patch_console_complete = f"{patch_mode_label} complete. Ledger: {ledger_path}"
+    _log(log_fn, f"[{run_id}] Starting {patch_mode_label}. Excel: {excel_path}")
+    _user(patch_start_message, 0.5)
+
+    sanitization_log_path = os.path.join("output", "logs", "input_sanitization.log")
+    _sanitization_log = make_input_audit_logger(sanitization_log_path, run_id, log_fn=log_fn)
+
+    rows = read_excel_rows(
+        excel_path,
+        cfg=cfg,
+        log_fn=_sanitization_log,
+        require_address_columns=True,
+    )
+
+    stats = {
+        "input_rows": len(rows),
+        "address_dry_run_filled": 0,
+        "address_patched": 0,
+        "address_not_found": 0,
+        "address_skipped_not_owned": 0,
+        "skipped": 0,
+        "errors": 0,
+        "stopped": 0,
+    }
+
+    def _inc(key: str, n: int = 1):
+        stats[key] = int(stats.get(key, 0)) + n
+
+    if not rows:
+        _user("No rows found in Excel.", 0.5)
+        return {"run_id": run_id, "ledger_path": ledger_path, **stats}
+
+    prepared_rows, invalid_rows = prepare_input_rows(
+        rows,
+        cfg,
+        validation_log_fn=_sanitization_log,
+        require_address_fields=True,
+    )
+
+    for invalid in invalid_rows:
+        _log(
+            log_fn,
+            f"[{run_id}] {invalid.action}: row {invalid.excel_row_num} "
+            f"{invalid.ssid or '(no SSID)'} ({invalid.display_name}) -> {invalid.details}",
+        )
+        _inc("skipped")
+        _user(f"{invalid.action}||display_name={invalid.display_name}", ui_hold_default)
+        append_ledger_xlsx(ledger_path, {
+            "run_id": run_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "ssid": invalid.ssid,
+            "student_name": invalid.display_name,
+            "action": invalid.action,
+            "details": invalid.details,
+            "screenshot": "",
+            "trace": "",
+        })
+
+    if not prepared_rows:
+        _user("No valid rows found in Excel.", 0.5)
+        _log(log_fn, f"[{run_id}] No valid address-patch rows found. Ledger: {ledger_path}")
+        return {"run_id": run_id, "ledger_path": ledger_path, **stats}
+
+    total = len(prepared_rows)
+
+    headless = bool(cfg.get("run", {}).get("headless", False))
+    if override_headless is not None:
+        headless = bool(override_headless)
+
+    slow_mo_ms = int(cfg.get("run", {}).get("slow_mo_ms", 0))
+    if override_slow_mo_ms is not None:
+        slow_mo_ms = int(override_slow_mo_ms)
+    trace_on_failure = bool(cfg.get("trace", {}).get("on_failure", True))
+    stop_on_error = bool(cfg.get("run", {}).get("stop_on_error", False))
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, slow_mo=slow_mo_ms if slow_mo_ms > 0 else None)
+        context = browser.new_context(viewport={"width": 1600, "height": 1400})
+        page = context.new_page()
+
+        try:
+            login(page, username, password, cfg, log_fn=log_fn)
+        except Exception as e:
+            _log(log_fn, f"[{run_id}] FATAL LOGIN ERROR -> {e}")
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+            raise
+
+        if _should_stop():
+            _user("Stopped by user.", 0.5)
+            context.close()
+            browser.close()
+            return {"run_id": run_id, "ledger_path": ledger_path, **stats}
+
+        _log(log_fn, f"[{run_id}] Logged in. Opening Student Records for {patch_mode_label}...")
+        _user("Logged in. Opening Student Records...", 0.5)
+        goto_student_records(page, cfg=cfg, log_fn=log_fn, run_id=run_id)
+
+        for i, prepared in enumerate(prepared_rows):
+            if _should_stop():
+                _user("Stopped by user.", 0.5)
+                _inc("stopped")
+                break
+
+            student = prepared.student
+            display_name = prepared.display_name
+            trace_path = ""
+            screenshot_path = ""
+
+            _user(f"🔎 {i+1} of {total}: Patching {display_name}...", 0.5)
+
+            try:
+                if trace_on_failure:
+                    context.tracing.start(screenshots=True, snapshots=True, sources=True)
+
+                _log(log_fn, f"[{run_id}] ADDRESS processing SSID {student.ssid} ({display_name})")
+
+                goto_student_records(page, cfg=cfg, log_fn=log_fn, run_id=run_id)
+                _log(log_fn, f"[{run_id}] ADDRESS searching SSID {student.ssid} under '{cfg['workability']['search_project']}'...")
+                search_by_ssid(page, student.ssid, cfg)
+
+                outcome = determine_search_outcome(page, timeout_ms=5000)
+                if outcome != "FOUND":
+                    details = "Student not found in WAI; address patch skipped."
+                    _log(log_fn, f"[{run_id}] ADDRESS_NOT_FOUND: {student.ssid} ({display_name})")
+                    _user(f"ADDRESS_NOT_FOUND||display_name={display_name}", ui_hold_default)
+                    _inc("address_not_found")
+                    append_ledger_xlsx(ledger_path, {
+                        "run_id": run_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "ssid": student.ssid,
+                        "student_name": display_name,
+                        "action": "ADDRESS_NOT_FOUND",
+                        "details": details,
+                        "screenshot": "",
+                        "trace": "",
+                    })
+                    if trace_on_failure:
+                        context.tracing.stop()
+                    continue
+
+                owning_org = get_found_row_owning_org(page, student.ssid)
+                _log(log_fn, f"[{run_id}] ADDRESS owning org for {student.ssid}: {owning_org!r}")
+
+                if not is_already_owned_by_us(owning_org, cfg):
+                    details = f"Student found in WAI but not owned by configured org; owning org={owning_org!r}."
+                    _log(log_fn, f"[{run_id}] ADDRESS_SKIPPED_NOT_OWNED: {student.ssid} ({display_name}) -> {details}")
+                    _user(f"ADDRESS_SKIPPED_NOT_OWNED||display_name={display_name}", ui_hold_default)
+                    _inc("address_skipped_not_owned")
+                    append_ledger_xlsx(ledger_path, {
+                        "run_id": run_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "ssid": student.ssid,
+                        "student_name": display_name,
+                        "action": "ADDRESS_SKIPPED_NOT_OWNED",
+                        "details": details,
+                        "screenshot": "",
+                        "trace": "",
+                    })
+                    if trace_on_failure:
+                        context.tracing.stop()
+                    continue
+
+                _log(log_fn, f"[{run_id}] ADDRESS opening Edit for owned student {student.ssid} ({display_name})")
+                open_existing_student_edit(page)
+                open_addresses_tab(page, log_fn=log_fn, run_id=run_id)
+                patch_results = overwrite_existing_student_address(page, student, log_fn=log_fn, run_id=run_id)
+
+                action = "ADDRESS_DRY_RUN_FILLED"
+                if save_after_fill:
+                    _log(log_fn, f"[{run_id}] ADDRESS saving contact fields for {student.ssid} ({display_name})")
+                    click_save_robust(
+                        page,
+                        timeout_ms=15000,
+                        log_fn=log_fn,
+                        run_id=run_id,
+                        toast_regex=re.compile(r"(successfully\s+saved|address\s+saved\s+successfully)", re.I),
+                    )
+                    page.wait_for_timeout(1000)
+                    action = "ADDRESS_PATCHED"
+
+                screenshot_prefix = "address_patched" if save_after_fill else "address_dry_run"
+                screenshot_path = os.path.join("output", "screenshots", f"{screenshot_prefix}_{run_id}_{student.ssid}.png")
+                try:
+                    page.screenshot(path=screenshot_path, full_page=False)
+                except Exception:
+                    screenshot_path = ""
+
+                details = (
+                    f"Street={patch_results['street_address']}; City={patch_results['city']}; "
+                    f"State={patch_results['state']}; Zip={patch_results['zip_code']}; "
+                    f"Phone={patch_results['phone_number']}; Parent={patch_results['parent_name']}"
+                )
+
+                if save_after_fill:
+                    _inc("address_patched")
+                else:
+                    _inc("address_dry_run_filled")
+
+                _log(log_fn, f"[{run_id}] {action}: {student.ssid} ({display_name}) -> {details}")
+                _user(f"{action}||display_name={display_name}", ui_hold_default)
+                append_ledger_xlsx(ledger_path, {
+                    "run_id": run_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "ssid": student.ssid,
+                    "student_name": display_name,
+                    "action": action,
+                    "details": details,
+                    "screenshot": screenshot_path,
+                    "trace": "",
+                })
+
+                if trace_on_failure:
+                    context.tracing.stop()
+
+                if pause_after_first_patch:
+                    patch_desc = "saved" if save_after_fill else "filled"
+                    _log(log_fn, f"[{run_id}] ADDRESS {patch_mode_label} paused after first {patch_desc} owned student.")
+                    if pause_fn:
+                        pause_fn(page)
+                    else:
+                        input(f"{patch_mode_label} {patch_desc} the first owned student. Press Enter to close browser...")
+                    break
+
+            except Exception as exc:
+                if trace_on_failure:
+                    trace_path = os.path.join("output", "traces", f"trace_{run_id}_{student.ssid}.zip")
+                    try:
+                        context.tracing.stop(path=trace_path)
+                    except Exception:
+                        trace_path = ""
+
+                try:
+                    screenshot_path = os.path.join("output", "screenshots", f"address_error_{run_id}_{student.ssid}.png")
+                    page.screenshot(path=screenshot_path, full_page=True)
+                except Exception:
+                    screenshot_path = ""
+
+                try:
+                    close_transient_overlays(page)
+                except Exception:
+                    pass
+
+                _log(log_fn, f"[{run_id}] ADDRESS_ERROR: {student.ssid} ({display_name}) -> {exc}")
+                _user(f"ADDRESS_ERROR||display_name={display_name}", ui_hold_default)
+                _inc("errors")
+                append_ledger_xlsx(ledger_path, {
+                    "run_id": run_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "ssid": student.ssid,
+                    "student_name": display_name,
+                    "action": "ADDRESS_ERROR",
+                    "details": str(exc),
+                    "screenshot": screenshot_path,
+                    "trace": trace_path,
+                })
+
+                if stop_on_error:
+                    raise
+                continue
+
+        _log(log_fn, f"[{run_id}] {patch_mode_label} complete. Ledger: {ledger_path}")
+        _user(patch_complete_message, 0.5)
+
+        context.close()
+        browser.close()
+
+        print(patch_console_complete)
         return {"run_id": run_id, "ledger_path": ledger_path, **stats}
 
 
