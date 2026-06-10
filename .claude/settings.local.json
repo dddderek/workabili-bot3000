@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv\\\\Scripts\\\\pip install *)",
+      "PowerShell(Get-Command python, pip -ErrorAction SilentlyContinue)"
+    ]
+  }
+}

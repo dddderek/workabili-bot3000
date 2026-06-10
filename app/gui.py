@@ -7,7 +7,7 @@ import yaml
 from openpyxl import load_workbook, Workbook
 
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QPoint, QRect, QEasingCurve, QPropertyAnimation, QParallelAnimationGroup, Property, QSize, QByteArray, QUrl, QSettings, QEvent, QTimer
-from PySide6.QtGui import QFont, QIcon, QPalette, QColor, QFontInfo, QFontMetrics, QPixmap, QPainter, QDesktopServices, QTextCursor
+from PySide6.QtGui import QFont, QIcon, QPalette, QColor, QFontInfo, QFontMetrics, QPixmap, QPainter, QImage, QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -47,8 +47,13 @@ from app.runner import run as run_runner, run_serve as run_serve_runner
 
 CONFIG_PATH = os.path.join("config", "config.yaml")
 
-# Splash image (transparent PNG) — place at: Workabili-Bot3000/assets/splash.png
+# Splash video (WebM VP9 with alpha)
 SPLASH_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "assets", "01_RAW_from_Seedance2_Workabilibot_Intro_V1.webm")
+)
+
+# Splash image (transparent PNG) — shown after the video ends
+SPLASH_PNG_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "assets", "splash.png")
 )
 
@@ -97,9 +102,7 @@ def apply_modern_palette(app: QApplication):
 
 
 class _SplashClickFilter(QObject):
-    """
-    Global click catcher: any mouse click anywhere dismisses the splash.
-    """
+    """Global click catcher: any mouse click anywhere dismisses the splash."""
     def __init__(self, app: QApplication, splash: QWidget):
         super().__init__()
         self._app = app
@@ -119,117 +122,63 @@ class _SplashClickFilter(QObject):
         return False
 
 
-class SplashScreen(QWidget):
+class PngSplashScreen(QWidget):
     """
-    Transparent top-level splash window displaying a transparent PNG.
-    Dismisses on:
-      - clicking the splash itself
-      - any mouse click anywhere in the app (via _SplashClickFilter)
-
-    IMPORTANT:
-    To avoid 1px "stair-step" motion on top-level windows (no subpixel window moves),
-    we keep the WINDOW fixed and subpixel-animate the PIXMAP inside via QPainter.
+    Transparent top-level splash displaying the robot PNG.
+    Shown behind the video splash; click to dismiss after the video ends.
     """
-    def __init__(self, png_path: str, sound_path: str = ""):
+    def __init__(self, png_path: str):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         self._pix = QPixmap(png_path) if png_path else QPixmap()
-
         self._max_scale = 1.03
         self._drift_px = 15.0
         self._progress = 0.0
         self._anim_started = False
         self._fade_anim = None
 
-        # Non-blocking splash sound (WAV recommended for reliability)
-        self._sound = None
-        self._sound_path = (sound_path or "").strip()
-        if self._sound_path and os.path.exists(self._sound_path):
-            try:
-                s = QSoundEffect(self)
-                s.setSource(QUrl.fromLocalFile(self._sound_path))
-                s.setLoopCount(1)
-                s.setVolume(0.9)  # 0.0 to 1.0
-                self._sound = s
-            except Exception:
-                self._sound = None
-
         if self._pix.isNull():
             self.resize(1, 1)
         else:
-            # Make window large enough to contain the *largest* scaled pixmap (so we never clip).
             w = int(self._pix.width() * self._max_scale + 0.999)
             h = int(self._pix.height() * self._max_scale + 0.999)
             self.setFixedSize(max(1, w), max(1, h))
 
     def showEvent(self, event):
         super().showEvent(event)
-
-        # Center the TOP-LEVEL WINDOW once (window stays fixed; content animates inside)
         screen = QApplication.screenAt(self.pos()) or QApplication.primaryScreen()
-        if not screen:
-            return
-        g = screen.availableGeometry()
-        x = g.left() + (g.width() - self.width()) // 2
-        y = g.top() + (g.height() - self.height()) // 2
-        self.move(x, y)
-
-        if self._pix.isNull():
-            return
-
-        # Start animation once
-        if self._anim_started:
+        if screen:
+            g = screen.availableGeometry()
+            self.move(
+                g.left() + (g.width() - self.width()) // 2,
+                g.top() + (g.height() - self.height()) // 2,
+            )
+        if self._pix.isNull() or self._anim_started:
             return
         self._anim_started = True
-
-        self.setWindowOpacity(1.0)  # window stays opaque; we animate pix opacity in paintEvent
-
+        self.setWindowOpacity(1.0)
         self._fade_anim = QPropertyAnimation(self, b"progress", self)
         self._fade_anim.setDuration(2000)
         self._fade_anim.setStartValue(0.0)
         self._fade_anim.setEndValue(1.0)
         self._fade_anim.setEasingCurve(QEasingCurve.InOutQuad)
-        # Play sound (non-blocking)
-        try:
-            if self._sound:
-                self._sound.play()
-        except Exception:
-            pass
-
         self._fade_anim.start()
 
     def paintEvent(self, event):
         if self._pix.isNull():
             return
-
-        # Use separate easing for motion/settle to feel "arrive and stop" buttery.
-        t = float(self._progress or 0.0)
-        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-
+        t = max(0.0, min(1.0, float(self._progress or 0.0)))
         motion = QEasingCurve(QEasingCurve.OutCubic).valueForProgress(t)
-
-        # Opacity fades in across the whole duration
-        opacity = t
-
-        # Drift: start lower, end at rest (subpixel)
         dy = self._drift_px * (1.0 - motion)
-
-        # Scale: start slightly larger, settle to 1.0
         scale = self._max_scale - (self._max_scale - 1.0) * motion
-
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        painter.setOpacity(opacity)
-
-        # Draw centered with transform (float translation + scale = subpixel smooth)
-        cx = self.width() / 2.0
-        cy = self.height() / 2.0
-
+        painter.setOpacity(t)
+        cx, cy = self.width() / 2.0, self.height() / 2.0
         painter.translate(cx, cy + dy)
         painter.scale(scale, scale)
         painter.translate(-self._pix.width() / 2.0, -self._pix.height() / 2.0)
-
         painter.drawPixmap(0, 0, self._pix)
         painter.end()
 
@@ -239,13 +188,6 @@ class SplashScreen(QWidget):
                 self._fade_anim.stop()
         except Exception:
             pass
-
-        try:
-            if self._sound:
-                self._sound.stop()
-        except Exception:
-            pass
-
         self.close()
         return super().mousePressEvent(event)
 
@@ -257,6 +199,310 @@ class SplashScreen(QWidget):
         self.update()
 
     progress = Property(float, _get_progress, _set_progress)
+
+
+class SplashScreen(QWidget):
+    """
+    Transparent top-level splash that plays a VP9+alpha WebM video.
+
+    OpenCV cannot extract the VP9 alpha plane on Windows; instead we pipe
+    raw yuva420p frames from FFmpeg (bundled via imageio-ffmpeg), convert
+    Y/U/V/A planes to BGRA via OpenCV, and paint each frame onto a fully
+    transparent frameless Qt window.
+
+    Dismisses on:
+      - video reaching its last frame (auto-close)
+      - any mouse click (immediate close)
+    """
+
+    video_finished = Signal()       # emitted when the last frame plays naturally
+    fade_progress = Signal(float)   # 0.0→1.0 during last 10 frames (drives app fade-in)
+
+    # Target display size (visual pixels at 100% DPI; divided by devicePixelRatio at runtime)
+    _DISPLAY_W = 1497
+    _DISPLAY_H = 840
+
+    def __init__(self, video_path: str, sound_path: str = "", end_sound_path: str = ""):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        self._proc = None
+        self._valid = False
+        self._src_w = 0
+        self._src_h = 0
+        self._display_w = 1
+        self._display_h = 1
+        self._frame_bytes = 0
+        self._video_duration_ms = 0
+        self._total_frames = 0
+        self._frame_count = 0
+        self._end_sound_path = (end_sound_path or "").strip()
+        self._current_pix = QPixmap()
+        self._frame_timer = QTimer(self)
+        self._frame_timer.timeout.connect(self._next_frame)
+        self._frame_interval_ms = 20  # default; overridden from probe
+
+        if video_path and os.path.exists(video_path):
+            self._init_ffmpeg(video_path)
+
+        if self._valid:
+            self.setFixedSize(self._display_w, self._display_h)
+        else:
+            self.resize(1, 1)
+
+        # Sound: prefer explicit WAV override, fall back to audio extracted from video
+        self._sound = None
+        self._temp_audio_path = getattr(self, "_temp_audio_path", None)
+        effective_sound = (sound_path or "").strip() or (self._temp_audio_path or "")
+        if effective_sound and os.path.exists(effective_sound):
+            try:
+                s = QSoundEffect(self)
+                s.setSource(QUrl.fromLocalFile(effective_sound))
+                s.setLoopCount(1)
+                s.setVolume(0.9)
+                self._sound = s
+            except Exception:
+                pass
+
+    def _init_ffmpeg(self, video_path: str):
+        try:
+            import imageio_ffmpeg
+            import subprocess
+            import tempfile
+
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+            # Probe dimensions, fps, and whether an audio stream exists
+            probe_proc = subprocess.run(
+                [ffmpeg_exe, "-i", video_path],
+                capture_output=True, text=True,
+            )
+            W, H, fps, duration_s = self._parse_ffmpeg_probe(probe_proc.stderr)
+            if not (W and H):
+                return
+            self._video_duration_ms = int(duration_s * 1000)
+            self._total_frames = max(1, int(duration_s * fps))
+
+            # Extract audio to a temp WAV so QSoundEffect can play it
+            if "Audio:" in probe_proc.stderr:
+                try:
+                    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                    tmp.close()
+                    subprocess.run(
+                        [ffmpeg_exe, "-y", "-i", video_path, "-vn",
+                         "-af", "volume=2.0",
+                         "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", tmp.name],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    self._temp_audio_path = tmp.name
+                except Exception:
+                    self._temp_audio_path = None
+            else:
+                self._temp_audio_path = None
+
+            self._src_w = W
+            self._src_h = H
+            # Divide by device pixel ratio so the visual size matches _DISPLAY_W/H
+            # regardless of Windows display scaling (e.g. 150% DPI)
+            screen = QApplication.primaryScreen()
+            dpr = screen.devicePixelRatio() if screen else 1.0
+            self._display_w = max(1, int(self._DISPLAY_W / dpr))
+            self._display_h = max(1, int(self._DISPLAY_H / dpr))
+            self._frame_interval_ms = max(1, int(1000.0 / fps))
+
+            # yuva420p layout per frame:
+            #   Y plane:  W * H
+            #   U plane: (W//2) * (H//2)
+            #   V plane: (W//2) * (H//2)
+            #   A plane:  W * H
+            self._frame_bytes = W * H + (W // 2) * (H // 2) * 2 + W * H
+
+            decode_cmd = [
+                ffmpeg_exe,
+                "-vcodec", "libvpx-vp9",
+                "-i", video_path,
+                "-pix_fmt", "yuva420p",
+                "-f", "rawvideo",
+                "pipe:1",
+            ]
+            self._proc = subprocess.Popen(
+                decode_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            self._valid = True
+            self._cv2 = __import__("cv2")
+            self._np = __import__("numpy")
+
+        except Exception:
+            self._valid = False
+
+    @staticmethod
+    def _parse_ffmpeg_probe(stderr_text: str):
+        """Extract width, height, fps, duration_seconds from `ffmpeg -i` stderr output."""
+        import re
+        W = H = 0
+        fps = 50.0
+        duration_s = 0.0
+        m = re.search(r"(\d+)x(\d+).*?(\d+(?:\.\d+)?) fps", stderr_text)
+        if m:
+            W, H = int(m.group(1)), int(m.group(2))
+            fps = float(m.group(3))
+        d = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr_text)
+        if d:
+            duration_s = int(d.group(1)) * 3600 + int(d.group(2)) * 60 + float(d.group(3))
+        return W, H, fps, duration_s
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._valid:
+            return
+
+        screen = QApplication.screenAt(self.pos()) or QApplication.primaryScreen()
+        if screen:
+            g = screen.availableGeometry()
+            self.move(
+                g.left() + (g.width() - self.width()) // 2 + 5,
+                g.top() + (g.height() - self.height()) // 2 - 13,
+            )
+
+        self._next_frame()  # prime first frame immediately (no blank flash)
+
+        try:
+            if self._sound:
+                self._sound.play()
+        except Exception:
+            pass
+
+        self._frame_timer.start(self._frame_interval_ms)
+
+        # Fire end sound 500ms before the video finishes (cancellable on early dismiss)
+        if self._end_sound_path and os.path.exists(self._end_sound_path) and self._video_duration_ms > 500:
+            fire_at_ms = max(0, self._video_duration_ms - 500)
+            def _play_end_sound():
+                try:
+                    s = QSoundEffect(self)
+                    s.setSource(QUrl.fromLocalFile(self._end_sound_path))
+                    s.setLoopCount(1)
+                    s.setVolume(0.63)
+                    s.play()
+                    self._end_sound_effect = s
+                except Exception:
+                    pass
+            self._end_sound_timer = QTimer(self)
+            self._end_sound_timer.setSingleShot(True)
+            self._end_sound_timer.timeout.connect(_play_end_sound)
+            self._end_sound_timer.start(fire_at_ms)
+
+    def _next_frame(self):
+        if not self._valid or self._proc is None:
+            return
+
+        raw = self._proc.stdout.read(self._frame_bytes)
+        if len(raw) < self._frame_bytes:
+            # Stream ended naturally — ensure full crossfade then close
+            self._frame_timer.stop()
+            self.setWindowOpacity(0.0)
+            self.fade_progress.emit(1.0)
+            self.video_finished.emit()
+            self.close()
+            return
+
+        self._frame_count += 1
+        frames_remaining = max(0, self._total_frames - self._frame_count)
+
+        if frames_remaining < 10:
+            # Fade out: video 1→0, app 0→1
+            t = min(1.0, 1.0 - frames_remaining / 10.0)
+            self.setWindowOpacity(1.0 - t)
+            self.fade_progress.emit(t)
+        elif self._frame_count <= 15:
+            # Fade in: video 0→1 over first 15 frames
+            self.setWindowOpacity(self._frame_count / 15.0)
+
+        np = self._np
+        cv2 = self._cv2
+        W, H = self._src_w, self._src_h
+
+        # Unpack yuva420p planes
+        y_end = W * H
+        uv_size = (W // 2) * (H // 2)
+        y = np.frombuffer(raw[:y_end], dtype=np.uint8).reshape(H, W)
+        u = np.frombuffer(raw[y_end: y_end + uv_size], dtype=np.uint8).reshape(H // 2, W // 2)
+        v = np.frombuffer(raw[y_end + uv_size: y_end + 2 * uv_size], dtype=np.uint8).reshape(H // 2, W // 2)
+        a = np.frombuffer(raw[y_end + 2 * uv_size:], dtype=np.uint8).reshape(H, W)
+
+        # Upsample chroma planes to full resolution
+        u_full = cv2.resize(u, (W, H), interpolation=cv2.INTER_LINEAR)
+        v_full = cv2.resize(v, (W, H), interpolation=cv2.INTER_LINEAR)
+
+        # YUV → BGR
+        yuv = np.stack([y, u_full, v_full], axis=2)
+        bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+
+        # Merge alpha channel
+        bgra = np.concatenate([bgr, a[:, :, np.newaxis]], axis=2)
+
+        # Scale to display size
+        bgra = cv2.resize(bgra, (self._display_w, self._display_h), interpolation=cv2.INTER_AREA)
+
+        # BGRA → RGBA (Qt Format_RGBA8888)
+        rgba = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA)
+
+        dh, dw = rgba.shape[:2]
+        qi = QImage(rgba.tobytes(), dw, dh, dw * 4, QImage.Format_RGBA8888)
+        self._current_pix = QPixmap.fromImage(qi)
+        self.update()
+
+    def paintEvent(self, event):
+        if self._current_pix.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(0, 0, self._current_pix)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        self._dismiss()
+        self.close()
+        return super().mousePressEvent(event)
+
+    def closeEvent(self, event):
+        self._dismiss()
+        super().closeEvent(event)
+
+    def _dismiss(self):
+        try:
+            self.fade_progress.emit(1.0)
+        except Exception:
+            pass
+        try:
+            self._frame_timer.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_end_sound_timer", None):
+                self._end_sound_timer.stop()
+        except Exception:
+            pass
+        try:
+            if self._sound:
+                self._sound.stop()
+        except Exception:
+            pass
+        try:
+            if self._proc:
+                self._proc.stdout.close()
+                self._proc.terminate()
+                self._proc = None
+        except Exception:
+            pass
+        try:
+            if self._temp_audio_path and os.path.exists(self._temp_audio_path):
+                os.unlink(self._temp_audio_path)
+                self._temp_audio_path = None
+        except Exception:
+            pass
 
 
 class UiBus(QObject):
@@ -2654,27 +2900,41 @@ def main():
     app = QApplication([])
     apply_modern_palette(app)
 
-    # Splash (transparent PNG, top-level window)
-    splash = SplashScreen(SPLASH_PATH, SPLASH_SOUND_PATH)
-    if not getattr(splash, "_pix", QPixmap()).isNull():
+    # Main window — opacity set to 0 BEFORE show so the frame never flashes visible
+    w = MainWindow()
+    w.setWindowOpacity(0.0)
+    w.show()
+
+    # PNG splash (robot) — starts invisible behind video; crossfade reveals it with the app
+    png_splash = PngSplashScreen(SPLASH_PNG_PATH)
+    if not png_splash._pix.isNull():
+        png_splash.setWindowOpacity(0.0)
+        png_splash.show()
+        png_filter = _SplashClickFilter(app, png_splash)
+        app.installEventFilter(png_filter)
+        app._workabili_png_splash = png_splash
+        app._workabili_png_filter = png_filter
+
+    # Video splash — plays on top; crossfades into app+PNG during last 10 frames
+    splash = SplashScreen(SPLASH_PATH, "", end_sound_path=SPLASH_SOUND_PATH)
+    if getattr(splash, "_valid", False):
+        def _on_fade(t: float):
+            w.setWindowOpacity(t)
+            if not png_splash._pix.isNull():
+                png_splash.setWindowOpacity(t)
+        splash.fade_progress.connect(_on_fade)
+
+        # Safety net: if anything goes wrong, ensure app is fully visible
+        def _ensure_visible():
+            w.setWindowOpacity(1.0)
+            if not png_splash._pix.isNull():
+                png_splash.setWindowOpacity(1.0)
+        splash.video_finished.connect(_ensure_visible)
+
         splash.show()
         splash.raise_()
         splash.activateWindow()
-
-        # Any click anywhere dismisses splash
-        splash_filter = _SplashClickFilter(app, splash)
-        app.installEventFilter(splash_filter)
-
-        # Keep references so Qt doesn't GC them
         app._workabili_splash = splash
-        app._workabili_splash_filter = splash_filter
-
-    w = MainWindow()
-    w.show()
-
-    # Keep splash above main window until dismissed
-    if hasattr(app, "_workabili_splash") and app._workabili_splash.isVisible():
-        app._workabili_splash.raise_()
 
     app.exec()
 
