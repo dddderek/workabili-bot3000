@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(.venv\\\\Scripts\\\\pip install *)",
-      "PowerShell(Get-Command python, pip -ErrorAction SilentlyContinue)"
+      "PowerShell(Get-Command python, pip -ErrorAction SilentlyContinue)",
+      "Bash(ffmpeg -i \"assets/Shrimpzilla_Intro.mp4\" -c:v libvpx-vp9 -b:v 2000k \"assets/Shrimpzilla_Intro.webm\")",
+      "PowerShell(ffmpeg -i \"assets\\\\Shrimpzilla_Intro.mp4\" -c:v libvpx-vp9 -b:v 2000k \"assets\\\\Shrimpzilla_Intro.webm\")",
+      "PowerShell(Get-ChildItem \"C:\\\\Program Files\", \"C:\\\\Program Files \\(x86\\)\", \"$env:USERPROFILE\\\\scoop\\\\shims\", \"$env:USERPROFILE\\\\AppData\\\\Local\" -Filter \"ffmpeg.exe\" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5 FullName)",
+      "PowerShell(& \"$env:LOCALAPPDATA\\\\Microsoft\\\\WinGet\\\\Links\\\\ffmpeg.exe\" -i \"assets\\\\Shrimpzilla_Intro.mp4\" -c:v libvpx-vp9 -b:v 2000k \"assets\\\\Shrimpzilla_Intro.webm\")",
+      "Bash(mkdir -p \"C:/Users/derek.carlson/.claude/projects/C--Users-derek-carlson-OneDrive---San-Bernardino-County-Superintendent-of-Schools-Etc-Workability-Workabili-Bot3000-v2-workabili-bot3000/memory\")"
     ]
   }
 }

@@ -49,7 +49,7 @@ CONFIG_PATH = os.path.join("config", "config.yaml")
 
 # Splash video (WebM VP9 with alpha)
 SPLASH_PATH = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "assets", "01_RAW_from_Seedance2_Workabilibot_Intro_V1.webm")
+    os.path.join(os.path.dirname(__file__), "..", "assets", "Shrimpzilla_Intro.webm")
 )
 
 # Splash image (transparent PNG) — shown after the video ends
