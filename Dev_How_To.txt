@@ -1,10 +1,23 @@
-Git Pull:
+Git Pull (get latest changes from cloud and integrate locally):
 
-Git push:
+> git pull origin main
+
+Git push (commit your changes to the cloud):
+
+git add  .  (adds anything that changed or was added)
+git commit . -m "What changes were made"
+git status
+git log origin/main..HEAD --oneline  (to see what all is about to be pushed)
+git push origin main
+
+NOTE: 
+
+main — your local branch
+origin/main — the remote (cloud) copy, on GitHub
 
 
 
-Address Pickup Shrimpzilla's Machine:
+:: Address Pickup Shrimpzilla's Machine ::
 
 python -m app.address_patch --excel "input\Pick Up Addresses Test 3.xlsx" --save --pause-after-first
 
