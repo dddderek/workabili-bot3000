@@ -1064,6 +1064,23 @@ def read_excel_rows(
     return out
 
 
+def rows_have_address_columns(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -> bool:
+    if not rows:
+        return False
+    cols = cfg["columns"]
+    headers = set(rows[0].keys())
+    return all(cols.get(key) in headers for key in ADDRESS_REQUIRED_COLUMN_KEYS)
+
+
+def rows_have_partial_address_columns(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -> bool:
+    if not rows:
+        return False
+    cols = cfg["columns"]
+    headers = set(rows[0].keys())
+    present = [cols.get(key) for key in ADDRESS_REQUIRED_COLUMN_KEYS if cols.get(key) in headers]
+    return bool(present) and len(present) < len(ADDRESS_REQUIRED_COLUMN_KEYS)
+
+
 # =========================
 # Playwright Actions
 # =========================
@@ -2459,6 +2476,12 @@ def run(
     _sanitization_log = make_input_audit_logger(sanitization_log_path, run_id, log_fn=log_fn)
 
     rows = read_excel_rows(excel_path, cfg=cfg, log_fn=_sanitization_log)
+    update_addresses = rows_have_address_columns(rows, cfg)
+    if rows_have_partial_address_columns(rows, cfg):
+        raise ValueError(
+            "INPUT_HEADER_ERROR: Create can update addresses only when all address headers are present: "
+            f"{expected_address_headers(cfg)!r}"
+        )
 
     # -------------------------
     # Run summary stats (for UI)
@@ -2470,6 +2493,7 @@ def run(
         "transfer_pending": 0,
         "transferred_prior_year": 0,
         "already_owned": 0,
+        "address_patched": 0,
         "skipped": 0,
         "errors": 0,
         "stopped": 0,
@@ -2492,6 +2516,7 @@ def run(
         rows,
         cfg,
         validation_log_fn=_sanitization_log,
+        require_address_fields=update_addresses,
     )
 
     for invalid in invalid_rows:
@@ -2752,6 +2777,50 @@ def run(
                     })
                     completed.add(student.ssid)
 
+                    if update_addresses:
+                        _log(log_fn, f"[{run_id}] CREATED opening Addresses tab for {student.ssid} ({display_name})")
+                        open_addresses_tab(page, log_fn=log_fn, run_id=run_id)
+                        patch_results = overwrite_existing_student_address(page, student, log_fn=log_fn, run_id=run_id)
+
+                        _log(log_fn, f"[{run_id}] CREATED saving address/contact fields for {student.ssid} ({display_name})")
+                        click_save_robust(
+                            page,
+                            timeout_ms=15000,
+                            log_fn=log_fn,
+                            run_id=run_id,
+                            toast_regex=re.compile(r"(successfully\s+saved|address\s+saved\s+successfully)", re.I),
+                        )
+                        page.wait_for_timeout(1000)
+
+                        address_screenshot_path = os.path.join(
+                            "output",
+                            "screenshots",
+                            f"address_patched_{run_id}_{student.ssid}.png",
+                        )
+                        try:
+                            page.screenshot(path=address_screenshot_path, full_page=False)
+                        except Exception:
+                            address_screenshot_path = ""
+
+                        address_details = (
+                            f"Street={patch_results['street_address']}; City={patch_results['city']}; "
+                            f"State={patch_results['state']}; Zip={patch_results['zip_code']}; "
+                            f"Phone={patch_results['phone_number']}; Parent={patch_results['parent_name']}"
+                        )
+                        _inc("address_patched")
+                        _log(log_fn, f"[{run_id}] ADDRESS_PATCHED: {student.ssid} ({display_name}) -> {address_details}")
+                        _user(f"ADDRESS_PATCHED||display_name={display_name}", ui_hold_default)
+                        append_ledger_xlsx(ledger_path, {
+                            "run_id": run_id,
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "ssid": student.ssid,
+                            "student_name": display_name,
+                            "action": "ADDRESS_PATCHED",
+                            "details": address_details,
+                            "screenshot": address_screenshot_path,
+                            "trace": "",
+                        })
+
                 if trace_on_failure:
                     context.tracing.stop()
 
@@ -2872,6 +2941,14 @@ def run_serve(
     _sanitization_log = make_input_audit_logger(sanitization_log_path, run_id, log_fn=log_fn)
 
     rows = read_excel_rows(excel_path, cfg=cfg, log_fn=_sanitization_log)
+    # Address filling in serve mode is disabled by request.
+    # update_addresses = rows_have_address_columns(rows, cfg)
+    # if rows_have_partial_address_columns(rows, cfg):
+    #     raise ValueError(
+    #         "INPUT_HEADER_ERROR: Serve can update addresses only when all address headers are present: "
+    #         f"{expected_address_headers(cfg)!r}"
+    #     )
+    update_addresses = False
 
     stats = {
         "input_rows": len(rows),
@@ -2879,6 +2956,10 @@ def run_serve(
         "serve_saved": 0,
         "serve_skipped_not_owned": 0,
         "serve_not_found": 0,
+        "address_dry_run_filled": 0,
+        "address_patched": 0,
+        "address_not_found": 0,
+        "address_skipped_not_owned": 0,
         "created": 0,
         "transfer_requested": 0,
         "transfer_pending": 0,
@@ -2900,6 +2981,7 @@ def run_serve(
         rows,
         cfg,
         validation_log_fn=_sanitization_log,
+        require_address_fields=update_addresses,
     )
 
     for invalid in invalid_rows:
@@ -3034,6 +3116,59 @@ def run_serve(
 
                 _log(log_fn, f"[{run_id}] SERVE opening Edit for owned student {student.ssid} ({display_name})")
                 open_existing_student_edit(page)
+
+                # Address filling in serve mode is disabled by request.
+                # if update_addresses:
+                #     open_addresses_tab(page, log_fn=log_fn, run_id=run_id)
+                #     patch_results = overwrite_existing_student_address(page, student, log_fn=log_fn, run_id=run_id)
+                #
+                #     address_action = "ADDRESS_DRY_RUN_FILLED"
+                #     if save_after_fill:
+                #         _log(log_fn, f"[{run_id}] SERVE saving address/contact fields for {student.ssid} ({display_name})")
+                #         click_save_robust(
+                #             page,
+                #             timeout_ms=15000,
+                #             log_fn=log_fn,
+                #             run_id=run_id,
+                #             toast_regex=re.compile(r"(successfully\s+saved|address\s+saved\s+successfully)", re.I),
+                #         )
+                #         page.wait_for_timeout(1000)
+                #         address_action = "ADDRESS_PATCHED"
+                #
+                #     address_screenshot_prefix = "address_patched" if save_after_fill else "address_dry_run"
+                #     address_screenshot_path = os.path.join(
+                #         "output",
+                #         "screenshots",
+                #         f"{address_screenshot_prefix}_{run_id}_{student.ssid}.png",
+                #     )
+                #     try:
+                #         page.screenshot(path=address_screenshot_path, full_page=False)
+                #     except Exception:
+                #         address_screenshot_path = ""
+                #
+                #     address_details = (
+                #         f"Street={patch_results['street_address']}; City={patch_results['city']}; "
+                #         f"State={patch_results['state']}; Zip={patch_results['zip_code']}; "
+                #         f"Phone={patch_results['phone_number']}; Parent={patch_results['parent_name']}"
+                #     )
+                #     if save_after_fill:
+                #         _inc("address_patched")
+                #     else:
+                #         _inc("address_dry_run_filled")
+                #
+                #     _log(log_fn, f"[{run_id}] {address_action}: {student.ssid} ({display_name}) -> {address_details}")
+                #     _user(f"{address_action}||display_name={display_name}", ui_hold_default)
+                #     append_ledger_xlsx(ledger_path, {
+                #         "run_id": run_id,
+                #         "timestamp": datetime.utcnow().isoformat(),
+                #         "ssid": student.ssid,
+                #         "student_name": display_name,
+                #         "action": address_action,
+                #         "details": address_details,
+                #         "screenshot": address_screenshot_path,
+                #         "trace": "",
+                #     })
+
                 service_results = fill_array_of_services_dry_run(page, hours=hours, log_fn=log_fn, run_id=run_id)
 
                 action = "SERVE_DRY_RUN_FILLED"

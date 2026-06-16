@@ -15,6 +15,8 @@ from app.runner import (
     make_input_audit_logger,
     prepare_input_rows,
     read_excel_rows,
+    rows_have_address_columns,
+    rows_have_partial_address_columns,
     validate_and_prepare,
 )
 
@@ -355,6 +357,22 @@ class HeaderValidationTests(unittest.TestCase):
             self.assertEqual(rows[0][self.cfg["columns"]["street_address"]], "1537 W 7th Street #101")
         finally:
             path.unlink(missing_ok=True)
+
+    def test_address_column_detection_requires_full_set(self):
+        cols = self.cfg["columns"]
+        base = {header: "" for header in expected_input_headers(self.cfg)}
+        full = dict(base)
+        for key in ("street_address", "city", "state", "zip", "phone_number", "parent_name"):
+            full[cols[key]] = ""
+        partial = dict(base)
+        partial[cols["street_address"]] = ""
+
+        self.assertFalse(rows_have_address_columns([base], self.cfg))
+        self.assertFalse(rows_have_partial_address_columns([base], self.cfg))
+        self.assertTrue(rows_have_address_columns([full], self.cfg))
+        self.assertFalse(rows_have_partial_address_columns([full], self.cfg))
+        self.assertFalse(rows_have_address_columns([partial], self.cfg))
+        self.assertTrue(rows_have_partial_address_columns([partial], self.cfg))
 
     def test_address_headers_required_for_address_patch_mode(self):
         headers = expected_input_headers(self.cfg)

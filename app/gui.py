@@ -584,7 +584,7 @@ class MainWindow(QMainWindow):
             self._details_btn.setText("Details")
         self.resize(self.width(), self._collapsed_h)
 
-        self._append_status("Ready. 👇 Pick your Excel file, then choose Enroll / Transfer or Serve.\n")
+        self._append_status("Ready. Pick your Excel file, then choose Enroll / Transfer or Serve.\n")
 
 
         # Global click detection (disabled buttons don't receive events)
@@ -894,7 +894,7 @@ class MainWindow(QMainWindow):
         self.btn_serve.setStyleSheet(primary_btn_css)
         self.btn_serve.setFixedHeight(BTN_H)
         self.btn_serve.clicked.connect(self._on_serve_clicked)
-        self.btn_serve.setToolTip("Dry-run the Array of Services serve workflow.")
+        self.btn_serve.setToolTip("Mark Array of Services and update addresses when address columns are included.")
         self.btn_serve.setIcon(self._icon_from_svg(self._svg_with_color(self.LUCIDE_PLAY, "#ffffff"), 18))
         self.btn_serve.setIconSize(QSize(18, 18))
 
@@ -1665,7 +1665,7 @@ class MainWindow(QMainWindow):
 
         body = QLabel(
             "Click OK to proceed.\n\n"
-            "If you need to stop mid-process for any reason, click the Stop button (to the right of the Run button). "
+            "If you need to stop mid-process for any reason, click the Stop button. "
             "The run will finish the current step and halt safely."
         )
         body.setWordWrap(True)
@@ -1811,16 +1811,23 @@ class MainWindow(QMainWindow):
             m = msg.strip()
 
             # Suppress redundant "Starting ..." line from runner (GUI already prints run header).
-            if m.startswith("🚀 Starting") and "Workabili-Bot3000" in m:
+            if (
+                (m.startswith("🚀 Starting") and "Workabili-Bot3000" in m)
+                or m.startswith("Starting Workabili-Bot3000 address patch")
+            ):
                 return
 
             # Suppress runner's end-of-run line (GUI will render the final summary cleanly).
-            if m == "✅ Run complete. Check the ledger for details.":
+            if m in {
+                "✅ Run complete. Check the ledger for details.",
+                "Address patch completed. Check the ledger for details.",
+                "Address patch dry-run complete. Check the ledger for details.",
+            }:
                 return
 
             # Logged in message arrives after a quiet headless phase — stop the login heartbeat,
             # then start a short “opening records” heartbeat until first student processing appears.
-            if m.startswith("📚 Logged in. Opening Student Records"):
+            if m.startswith("📚 Logged in. Opening Student Records") or m.startswith("Logged in. Opening Student Records"):
                 self.bus.busy_stop.emit()
                 self.bus.user_msg.emit(m)
                 self.bus.busy_start.emit("⏳ Opening Student Records")
@@ -1856,6 +1863,28 @@ class MainWindow(QMainWindow):
                     self.bus.user_msg.emit(m)
                 return
 
+            if ": Patching " in m:
+                self.bus.busy_stop.emit()
+                try:
+                    prefix, rest = m.split(": Patching ", 1)
+                    tokens = prefix.strip().split()
+                    of_idx = tokens.index("of")
+                    self._progress_i = int(tokens[of_idx - 1])
+                    self._progress_n = int(tokens[of_idx + 1])
+                    name = rest.strip()
+                    if name.endswith("..."):
+                        name = name[:-3].strip()
+                    elif name.endswith("…"):
+                        name = name[:-1].strip()
+                    self._progress_name = name
+
+                    self.bus.user_msg.emit("")
+                    name_html = f'<span style="color:#facc15; font-weight:700;">{name}</span>'
+                    self.bus.user_msg.emit(f"{self._progress_i} of {self._progress_n}: Adding address for {name_html}...")
+                except Exception:
+                    self.bus.user_msg.emit(m)
+                return
+
             state = m
             ctx = {}
 
@@ -1879,11 +1908,16 @@ class MainWindow(QMainWindow):
                     "SERVE_SAVED",
                     "SERVE_SKIPPED_NOT_OWNED",
                     "SERVE_NOT_FOUND",
+                    "ADDRESS_DRY_RUN_FILLED",
+                    "ADDRESS_PATCHED",
+                    "ADDRESS_NOT_FOUND",
+                    "ADDRESS_SKIPPED_NOT_OWNED",
                     "SKIPPED_RESUME",
                     "SKIPPED_MISSING_SSID",
                     "NEEDS_INPUT_DATA",
                     "ERROR",
                     "SERVE_ERROR",
+                    "ADDRESS_ERROR",
                 }:
                     self.bus.busy_stop.emit()
                 self.bus.user_msg.emit(self._user_message_for_state(state, **ctx))
@@ -2025,7 +2059,7 @@ class MainWindow(QMainWindow):
                     self.btn_run.setToolTip("Enroll new students and request or complete transfers.")
                     if hasattr(self, "btn_serve"):
                         self.btn_serve.setEnabled(True)
-                        self.btn_serve.setToolTip("Dry-run the Array of Services serve workflow.")
+                        self.btn_serve.setToolTip("Mark Array of Services and update addresses when address columns are included.")
 
     def _svg_with_color(self, svg: str, color_hex: str) -> str:
         # Lucide uses stroke="currentColor"; we replace with an explicit stroke color
@@ -2079,6 +2113,10 @@ class MainWindow(QMainWindow):
         n_serve_saved = int(summary.get("serve_saved", 0))
         n_serve_not_owned = int(summary.get("serve_skipped_not_owned", 0))
         n_serve_not_found = int(summary.get("serve_not_found", 0))
+        n_address_filled = int(summary.get("address_dry_run_filled", 0))
+        n_address_patched = int(summary.get("address_patched", 0))
+        n_address_not_owned = int(summary.get("address_skipped_not_owned", 0))
+        n_address_not_found = int(summary.get("address_not_found", 0))
 
         # Headline + vibe
         headline = "✅ SUCCESS!"
@@ -2121,15 +2159,30 @@ class MainWindow(QMainWindow):
             </div>
         """)
 
-        if n_serve_filled or n_serve_saved or n_serve_not_owned or n_serve_not_found:
+        has_serve_counts = bool(n_serve_filled or n_serve_saved or n_serve_not_owned or n_serve_not_found)
+        has_address_counts = bool(n_address_filled or n_address_patched or n_address_not_owned or n_address_not_found)
+        if has_serve_counts or has_address_counts:
+            address_lines = ""
+            if has_address_counts:
+                address_lines = f"""
+                <b>Addresses saved:</b> {n_address_patched}<br>
+                <b>Address dry-run filled:</b> {n_address_filled}<br>
+                """
+            serve_lines = ""
+            if has_serve_counts:
+                serve_lines = f"""
+                <b>Serve saved:</b> {n_serve_saved}<br>
+                <b>Serve dry-run filled:</b> {n_serve_filled}<br>
+                <b>Not with us:</b> {n_serve_not_owned}<br>
+                <b>Not found:</b> {n_serve_not_found}<br>
+                """
             box.setInformativeText(f"""
                 <div style="font-size:14px; line-height:1.7;">
                 <b>Students in input file:</b> {n_total}<br>
-                <b>✅ Serve saved:</b> {n_serve_saved}<br>
-                <b>⏭️ Not with us:</b> {n_serve_not_owned}<br>
-                <b>⚠️ Not found:</b> {n_serve_not_found}<br>
-                <b>⏭️ Invalid/skipped input:</b> {n_skipped}<br>
-                <b>❌ Errors:</b> {n_errors}
+                {address_lines}
+                {serve_lines}
+                <b>Invalid/skipped input:</b> {n_skipped}<br>
+                <b>Errors:</b> {n_errors}
                 </div>
             """)
 
@@ -2293,6 +2346,22 @@ class MainWindow(QMainWindow):
 
             # Transfers: this run
             transfers_run = [r for r in run_rows if (r.get("action") in ("TRANSFER_REQUESTED", "TRANSFER_PENDING", "TRANSFERRED_PRIOR_YEAR"))]
+            address_actions = {
+                "ADDRESS_DRY_RUN_FILLED",
+                "ADDRESS_PATCHED",
+                "ADDRESS_NOT_FOUND",
+                "ADDRESS_SKIPPED_NOT_OWNED",
+                "ADDRESS_ERROR",
+            }
+            serve_actions = {
+                "SERVE_DRY_RUN_FILLED",
+                "SERVE_SAVED",
+                "SERVE_SKIPPED_NOT_OWNED",
+                "SERVE_NOT_FOUND",
+                "SERVE_ERROR",
+            }
+            address_run = [r for r in run_rows if (r.get("action") in address_actions)]
+            served_run = [r for r in run_rows if (r.get("action") in serve_actions)]
 
             # Transfers: all open. Dedup across all ledger rows first so later
             # resolved states remove older transfer requests from the open list.
@@ -2312,11 +2381,17 @@ class MainWindow(QMainWindow):
 
             # Default tab selection:
             # - If transfers exist this run: Transfers + scope "This Run"
+            # - Else if Serve rows exist this run: Served
+            # - Else if addresses were patched this run: Addresses
             # - Else if any open transfers exist: Transfers + scope "All Open Transfers"
             # - Else prefer Created if any, otherwise All
             if len(transfers_run) > 0:
                 dlg.set_transfers_scope("This Run")
                 dlg.select_tab("Transfers")
+            elif len(served_run) > 0:
+                dlg.select_tab("Served")
+            elif len(address_run) > 0:
+                dlg.select_tab("Addresses")
             elif len(transfers_open) > 0:
                 dlg.select_tab("Transfers")
             else:
@@ -2415,6 +2490,11 @@ class RunResultsDialog(QDialog):
         "SERVE_SKIPPED_NOT_OWNED": "⏭️ Serve skipped - not with us",
         "SERVE_NOT_FOUND": "⚠️ Serve skipped - not found",
         "SERVE_ERROR": "❌ Serve error",
+        "ADDRESS_DRY_RUN_FILLED": "Address dry-run filled",
+        "ADDRESS_PATCHED": "Address saved",
+        "ADDRESS_NOT_FOUND": "Address skipped - not found",
+        "ADDRESS_SKIPPED_NOT_OWNED": "Address skipped - not with us",
+        "ADDRESS_ERROR": "Address error",
         "SKIPPED_RESUME": "⏭️ Already processed",
         "SKIPPED_MISSING_SSID": "⚠️ Missing SSID — skipped",
         "NEEDS_INPUT_DATA": "⚠️ Missing/invalid required data — skipped",
@@ -2444,6 +2524,14 @@ class RunResultsDialog(QDialog):
             "transfer_pending": int(self.summary.get("transfer_pending", 0)),
             "transferred_prior_year": int(self.summary.get("transferred_prior_year", 0)),
             "already_owned": int(self.summary.get("already_owned", 0)),
+            "serve_dry_run_filled": int(self.summary.get("serve_dry_run_filled", 0)),
+            "serve_saved": int(self.summary.get("serve_saved", 0)),
+            "serve_not_found": int(self.summary.get("serve_not_found", 0)),
+            "serve_skipped_not_owned": int(self.summary.get("serve_skipped_not_owned", 0)),
+            "address_dry_run_filled": int(self.summary.get("address_dry_run_filled", 0)),
+            "address_patched": int(self.summary.get("address_patched", 0)),
+            "address_not_found": int(self.summary.get("address_not_found", 0)),
+            "address_skipped_not_owned": int(self.summary.get("address_skipped_not_owned", 0)),
             "skipped": int(self.summary.get("skipped", 0)),
             "errors": int(self.summary.get("errors", 0)),
         }
@@ -2452,13 +2540,44 @@ class RunResultsDialog(QDialog):
         hdr.setStyleSheet("QLabel { font-size: 18px; font-weight: 800; color: #e2e8f0; }")
         outer.addWidget(hdr)
 
-        strip = QLabel(
+        address_total = (
+            counts["address_dry_run_filled"]
+            + counts["address_patched"]
+            + counts["address_not_found"]
+            + counts["address_skipped_not_owned"]
+        )
+        serve_total = (
+            counts["serve_dry_run_filled"]
+            + counts["serve_saved"]
+            + counts["serve_not_found"]
+            + counts["serve_skipped_not_owned"]
+        )
+        strip_text = (
             f"<b>✅ Created:</b> {counts['created']} &nbsp;&nbsp; "
             f"<b>📨+⏳ Transfers:</b> {counts['transfer_requested'] + counts['transfer_pending'] + counts['transferred_prior_year']} &nbsp;&nbsp; "
             f"<b>🏫 Already with us:</b> {counts['already_owned']} &nbsp;&nbsp; "
             f"<b>⏭️ Skipped:</b> {counts['skipped']} &nbsp;&nbsp; "
             f"<b>❌ Errors:</b> {counts['errors']}"
         )
+        if address_total and serve_total:
+            strip_text = (
+                f"<b>Addresses saved:</b> {counts['address_patched']} &nbsp;&nbsp; "
+                f"<b>Serve saved:</b> {counts['serve_saved']} &nbsp;&nbsp; "
+                f"<b>Not with us:</b> {counts['serve_skipped_not_owned']} &nbsp;&nbsp; "
+                f"<b>Not found:</b> {counts['serve_not_found']} &nbsp;&nbsp; "
+                f"<b>Skipped:</b> {counts['skipped']} &nbsp;&nbsp; "
+                f"<b>Errors:</b> {counts['errors']}"
+            )
+        elif address_total:
+            strip_text = (
+                f"<b>Addresses saved:</b> {counts['address_patched']} &nbsp;&nbsp; "
+                f"<b>Dry-run filled:</b> {counts['address_dry_run_filled']} &nbsp;&nbsp; "
+                f"<b>Not with us:</b> {counts['address_skipped_not_owned']} &nbsp;&nbsp; "
+                f"<b>Not found:</b> {counts['address_not_found']} &nbsp;&nbsp; "
+                f"<b>Skipped:</b> {counts['skipped']} &nbsp;&nbsp; "
+                f"<b>Errors:</b> {counts['errors']}"
+            )
+        strip = QLabel(strip_text)
         strip.setTextFormat(Qt.RichText)
         strip.setStyleSheet("QLabel { font-size: 13px; color: #cbd5e1; }")
         outer.addWidget(strip)
@@ -2489,10 +2608,11 @@ class RunResultsDialog(QDialog):
 
         self._add_table_tab("Created", self._filter_run(action="CREATED"))
         self._add_table_tab("Served", self._filter_run(actions={"SERVE_DRY_RUN_FILLED", "SERVE_SAVED", "SERVE_SKIPPED_NOT_OWNED", "SERVE_NOT_FOUND"}))
+        self._add_table_tab("Addresses", self._filter_run(actions={"ADDRESS_DRY_RUN_FILLED", "ADDRESS_PATCHED", "ADDRESS_NOT_FOUND", "ADDRESS_SKIPPED_NOT_OWNED", "ADDRESS_ERROR"}))
         self._add_transfers_tab()
         self._add_table_tab("Already With Us", self._filter_run(action="ALREADY_OWNED"))
         self._add_table_tab("Skipped", self._filter_run(actions={"SKIPPED_RESUME", "SKIPPED_MISSING_SSID", "NEEDS_INPUT_DATA"}))
-        self._add_table_tab("Errors", self._filter_run(actions={"ERROR", "SERVE_ERROR"}))
+        self._add_table_tab("Errors", self._filter_run(actions={"ERROR", "SERVE_ERROR", "ADDRESS_ERROR"}))
         self._add_table_tab("All", self._filter_run(actions=None))
 
         # Footer buttons
