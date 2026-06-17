@@ -62,6 +62,11 @@ SPLASH_SOUND_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "assets", "splash.wav")
 )
 
+# Outro video (WebM VP9 with alpha) — played before quitting
+OUTRO_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "assets", "Shrimp Scare V1 Outro.webm")
+)
+
 # Title image (transparent PNG)
 TITLE_IMAGE_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "assets", "workabili-bot3000-title.png")
@@ -564,6 +569,9 @@ class MainWindow(QMainWindow):
 
         self._stop_event = threading.Event()
         self._worker_thread = None
+        self._outro_splash = None
+        self._quitting_with_outro = False
+        self._outro_window_fade_timer = None
 
         # Per-user UI preferences (safe, tiny, non-invasive)
         self._settings = QSettings("Workabili", "Workabili-Bot3000")
@@ -937,20 +945,7 @@ class MainWindow(QMainWindow):
         self.btn_quit.setStyleSheet(danger_btn_css)
         self.btn_quit.setFixedHeight(BTN_H)
         self.btn_quit.setToolTip("Quit this application entirely.")
-        self.btn_quit.clicked.connect(
-            lambda: (
-                self.close()
-                if QMessageBox.question(
-                    self,
-                    "Quit Workabili-Bot3000",
-                    "Are you sure you want to quit?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                == QMessageBox.Yes
-                else None
-            )
-        )
+        self.btn_quit.clicked.connect(self._on_quit_clicked)
 
         self.btn_quit.setIcon(self._icon_from_svg(self._svg_with_color(self.LUCIDE_X, "#e2e8f0"), 18))
         self.btn_quit.setIconSize(QSize(18, 18))
@@ -1793,6 +1788,69 @@ class MainWindow(QMainWindow):
     def _on_stop_clicked(self):
         self.bus.user_msg.emit("🛑 Stop requested — finishing current step and halting safely")
         self._stop_event.set()
+
+    def _on_quit_clicked(self):
+        if QMessageBox.question(
+            self,
+            "Quit Workabili-Bot3000",
+            "Are you sure you want to quit?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
+        self._play_quit_outro_and_exit()
+
+    def _play_quit_outro_and_exit(self):
+        if self._quitting_with_outro:
+            return
+
+        self._quitting_with_outro = True
+        app = QApplication.instance()
+        if app:
+            app.setQuitOnLastWindowClosed(False)
+
+        self.setEnabled(False)
+        self.setWindowOpacity(1.0)
+
+        outro = SplashScreen(OUTRO_PATH)
+        if not getattr(outro, "_valid", False):
+            if app:
+                app.quit()
+            return
+
+        def _quit_after_outro(*_args):
+            if app:
+                app.quit()
+
+        outro.video_finished.connect(_quit_after_outro)
+        outro.destroyed.connect(_quit_after_outro)
+        outro.show()
+        outro.raise_()
+        outro.activateWindow()
+        self._outro_splash = outro
+        self._start_outro_window_fade()
+
+    def _start_outro_window_fade(self):
+        fade_start_delay_ms = 1000
+        fade_duration_ms = 1000
+        tick_ms = 33
+        steps = max(1, fade_duration_ms // tick_ms)
+        state = {"step": 0}
+
+        timer = QTimer(self)
+        timer.setInterval(tick_ms)
+
+        def _fade_tick():
+            state["step"] += 1
+            t = min(1.0, state["step"] / steps)
+            self.setWindowOpacity(1.0 - t)
+            if t >= 1.0:
+                timer.stop()
+
+        timer.timeout.connect(_fade_tick)
+        self._outro_window_fade_timer = timer
+        QTimer.singleShot(fade_start_delay_ms, timer.start)
 
     def _run_worker(self, args: RunArgs):
         """
