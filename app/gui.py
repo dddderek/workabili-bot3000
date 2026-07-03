@@ -49,7 +49,7 @@ CONFIG_PATH = os.path.join("config", "config.yaml")
 
 # Splash video (WebM VP9 with alpha)
 SPLASH_PATH = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "assets", "Shrimpzilla_Intro.webm")
+    os.path.join(os.path.dirname(__file__), "..", "assets", "Intro 720P 24fps V1.webm")
 )
 
 # Splash image (transparent PNG) — shown after the video ends
@@ -64,7 +64,7 @@ SPLASH_SOUND_PATH = os.path.normpath(
 
 # Outro video (WebM VP9 with alpha) — played before quitting
 OUTRO_PATH = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "assets", "Shrimp Scare V1 Outro.webm")
+    os.path.join(os.path.dirname(__file__), "..", "assets", "Outro 720P 30fps V1.webm")
 )
 
 # Title image (transparent PNG)
@@ -227,7 +227,7 @@ class SplashScreen(QWidget):
     _DISPLAY_W = 1497
     _DISPLAY_H = 840
 
-    def __init__(self, video_path: str, sound_path: str = "", end_sound_path: str = ""):
+    def __init__(self, video_path: str, sound_path: str = "", end_sound_path: str = "", fade_in: bool = True, scale: float = 1.0, offset_x: int = 0, offset_y: int = 0, gamma: float = 1.0, contrast: float = 1.0, brightness: int = 0):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
@@ -242,6 +242,18 @@ class SplashScreen(QWidget):
         self._total_frames = 0
         self._frame_count = 0
         self._end_sound_path = (end_sound_path or "").strip()
+        self._fade_in = fade_in
+        self._scale = scale
+        self._offset_x = offset_x
+        self._offset_y = offset_y
+        self._contrast = contrast
+        self._brightness = brightness
+        # Pre-build gamma LUT (identity if gamma == 1.0)
+        if gamma != 1.0:
+            _np = __import__("numpy")
+            self._gamma_lut = ((_np.arange(256) / 255.0) ** gamma * 255).astype(_np.uint8)
+        else:
+            self._gamma_lut = None
         self._current_pix = QPixmap()
         self._frame_timer = QTimer(self)
         self._frame_timer.timeout.connect(self._next_frame)
@@ -311,8 +323,8 @@ class SplashScreen(QWidget):
             # regardless of Windows display scaling (e.g. 150% DPI)
             screen = QApplication.primaryScreen()
             dpr = screen.devicePixelRatio() if screen else 1.0
-            self._display_w = max(1, int(self._DISPLAY_W / dpr))
-            self._display_h = max(1, int(self._DISPLAY_H / dpr))
+            self._display_w = max(1, int(self._DISPLAY_W * self._scale / dpr))
+            self._display_h = max(1, int(self._DISPLAY_H * self._scale / dpr))
             self._frame_interval_ms = max(1, int(1000.0 / fps))
 
             # yuva420p layout per frame:
@@ -367,8 +379,8 @@ class SplashScreen(QWidget):
         if screen:
             g = screen.availableGeometry()
             self.move(
-                g.left() + (g.width() - self.width()) // 2 + 5,
-                g.top() + (g.height() - self.height()) // 2 - 13,
+                g.left() + (g.width() - self.width()) // 2 + 5 + self._offset_x,
+                g.top() + (g.height() - self.height()) // 2 - 13 + self._offset_y,
             )
 
         self._next_frame()  # prime first frame immediately (no blank flash)
@@ -421,7 +433,7 @@ class SplashScreen(QWidget):
             t = min(1.0, 1.0 - frames_remaining / 10.0)
             self.setWindowOpacity(1.0 - t)
             self.fade_progress.emit(t)
-        elif self._frame_count <= 15:
+        elif self._fade_in and self._frame_count <= 15:
             # Fade in: video 0→1 over first 15 frames
             self.setWindowOpacity(self._frame_count / 15.0)
 
@@ -444,6 +456,14 @@ class SplashScreen(QWidget):
         # YUV → BGR
         yuv = np.stack([y, u_full, v_full], axis=2)
         bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+
+        # Apply gamma correction to colour channels only (preserves alpha)
+        if self._gamma_lut is not None:
+            bgr = self._gamma_lut[bgr]
+
+        # Apply contrast/brightness (alpha>1 = more contrast, beta<0 = shift darks down)
+        if self._contrast != 1.0 or self._brightness != 0:
+            bgr = cv2.convertScaleAbs(bgr, alpha=self._contrast, beta=self._brightness)
 
         # Merge alpha channel
         bgra = np.concatenate([bgr, a[:, :, np.newaxis]], axis=2)
@@ -1813,7 +1833,7 @@ class MainWindow(QMainWindow):
         self.setEnabled(False)
         self.setWindowOpacity(1.0)
 
-        outro = SplashScreen(OUTRO_PATH)
+        outro = SplashScreen(OUTRO_PATH, fade_in=False, scale=0.795, offset_x=-8, offset_y=-3, contrast=1.34, brightness=-40)
         if not getattr(outro, "_valid", False):
             if app:
                 app.quit()
@@ -1825,11 +1845,31 @@ class MainWindow(QMainWindow):
 
         outro.video_finished.connect(_quit_after_outro)
         outro.destroyed.connect(_quit_after_outro)
+
+        # Fade out main window over first 5 frames while outro plays immediately at full opacity.
+        FADE_FRAMES = 5
+        _orig_show = outro.showEvent
+        main_win = self
+        def _fadeout_show(event):
+            _orig_show(event)
+            state = {"step": 0}
+            fade_timer = QTimer(outro)
+            fade_timer.setInterval(outro._frame_interval_ms)
+            def _fade_tick():
+                state["step"] += 1
+                t = min(1.0, state["step"] / FADE_FRAMES)
+                main_win.setWindowOpacity(1.0 - t)
+                if state["step"] >= FADE_FRAMES:
+                    fade_timer.stop()
+                    main_win.hide()
+            fade_timer.timeout.connect(_fade_tick)
+            fade_timer.start()
+        outro.showEvent = _fadeout_show
+
         outro.show()
         outro.raise_()
         outro.activateWindow()
         self._outro_splash = outro
-        self._start_outro_window_fade()
 
     def _start_outro_window_fade(self):
         fade_start_delay_ms = 1000
@@ -3078,14 +3118,17 @@ def main():
     app = QApplication([])
     apply_modern_palette(app)
 
+    # Hold Ctrl at launch to skip the intro video entirely.
+    skip_intro = bool(QApplication.queryKeyboardModifiers() & Qt.ShiftModifier)
+
     # Main window — opacity set to 0 BEFORE show so the frame never flashes visible
     w = MainWindow()
-    w.setWindowOpacity(0.0)
+    w.setWindowOpacity(0.0 if not skip_intro else 1.0)
     w.show()
 
     # PNG splash (robot) — starts invisible behind video; crossfade reveals it with the app
     png_splash = PngSplashScreen(SPLASH_PNG_PATH)
-    if not png_splash._pix.isNull():
+    if not skip_intro and not png_splash._pix.isNull():
         png_splash.setWindowOpacity(0.0)
         png_splash.show()
         png_filter = _SplashClickFilter(app, png_splash)
@@ -3094,8 +3137,17 @@ def main():
         app._workabili_png_filter = png_filter
 
     # Video splash — plays on top; crossfades into app+PNG during last 10 frames
-    splash = SplashScreen(SPLASH_PATH, "", end_sound_path=SPLASH_SOUND_PATH)
-    if getattr(splash, "_valid", False):
+    # Scale the intro down on lower-DPI displays so it matches the apparent size
+    # it has on the 4K 150% work monitor. Interpolates between dpr=1.0 (65%) and
+    # dpr=1.5 (100%) so intermediate scaling values also look reasonable.
+    # NOTE: this only affects the intro — the outro scale is set separately in
+    # _play_quit_outro_and_exit and is completely unaffected by this.
+    _intro_dpr = (QApplication.primaryScreen().devicePixelRatio()
+                  if QApplication.primaryScreen() else 1.5)
+    _intro_scale = 0.710 + (_intro_dpr - 1.0) / (1.5 - 1.0) * (1.0 - 0.710)
+    _intro_scale = max(0.710, min(1.0, _intro_scale))
+    splash = SplashScreen(SPLASH_PATH, "", end_sound_path=SPLASH_SOUND_PATH, scale=_intro_scale, offset_x=20, offset_y=-15, contrast=1.34, brightness=-42)
+    if not skip_intro and getattr(splash, "_valid", False):
         def _on_fade(t: float):
             w.setWindowOpacity(t)
             if not png_splash._pix.isNull():
